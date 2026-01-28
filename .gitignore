@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Models / artifacts (원하면 유지/삭제)
+*.pt
+*.onnx
+*.engine
+*.log

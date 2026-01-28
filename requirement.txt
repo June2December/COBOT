@@ -1,0 +1,4 @@
+# requirements.txt v0.000
+
+ultralytics>=8.2.0
+numpy>=1.23.0
