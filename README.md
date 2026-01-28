@@ -30,25 +30,25 @@
 ```mermaid
 flowchart LR
   MIC[Mic] --> ASR[ASR Node]
-  ASR --> CMD[Voice Command Parser\nSTART/STOP/RETRY/NEXT]
+  ASR --> CMD["Voice Command Parser (START/STOP/RETRY/NEXT)"]
 
-  ARM[Robot Arm] --> KIN[Kinematics/TF2\nbase->ee]
-  KIN --> TF[Static TF\n ee->camera (hand-eye)]
+  ARM[Robot Arm] --> KIN["Kinematics/TF2 (base to ee)"]
+  KIN --> TF["Static TF (ee to camera)"]
 
-  CAM[Eye-in-Hand Camera] --> DET[Detection Node\nYOLO 등]
-  DET --> TRK[Tracking Node\nDetect-then-Track]
-  TRK --> WM[World Model\ntrack_id + (optional) base-frame pose]
+  CAM[Eye-in-Hand Camera] --> DET["Detection Node (YOLO 등)"]
+  DET --> TRK["Tracking Node (Detect-then-Track)"]
+  TRK --> WM["World Model (track_id, optional pose in base frame)"]
 
   TF --> WM
-  WM --> GATE[Policy Gate\nstable + voice 승인]
-  CMD --> ORCH[Orchestrator\nState Machine]
+  WM --> GATE["Policy Gate (stable + voice 승인)"]
+  CMD --> ORCH["Orchestrator (State Machine)"]
   GATE --> ORCH
 
-  ORCH --> EXEC[Executor\nRobot Arm Action]
+  ORCH --> EXEC["Executor (Robot Arm Action)"]
   EXEC --> ARM
 
-  ORCH --> FB[Firebase Logger\n(optional)]
-  ORCH --> UI[UI/Scoreboard\n(optional)]
+  ORCH --> FB["Firebase Logger (optional)"]
+  ORCH --> UI["UI/Scoreboard (optional)"]
 ```
 
 ---
