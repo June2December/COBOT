@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             "yolo_webcam_node = cobot2.yolo_webcam_node:main",
             "tcp_follow_node = cobot2.tcp_follow_node:main",
+            "yolo_camera_node = cobot2.yolo_camera_node:main",
         ],
     },
 )
