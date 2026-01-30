@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 from dotenv import load_dotenv
 
@@ -42,10 +41,8 @@ def main():
     node = VoiceToTopic(stt=stt)
 
     try:
-        # ✅ 한 번만 실행하고 publish
         node.run_once_and_publish()
 
-        # ✅ publish가 실제로 나가게 잠깐 spin (짧게)
         for _ in range(5):
             rclpy.spin_once(node, timeout_sec=0.1)
 

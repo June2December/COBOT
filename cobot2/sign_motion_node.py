@@ -64,7 +64,7 @@ class DambaeRobotNode(Node):
         self.set_accx = DSR.set_accx
         self.wait = DSR.wait
 
-        # ---- state ----
+        # state
         self._last_is_dambae = False
         self._last_stamp_ns = 0
         self._pending = False
@@ -73,9 +73,9 @@ class DambaeRobotNode(Node):
         self.create_service(Trigger, SERVICE_NAME, self._on_service)
 
         # motion params
-        self.ud_amp_mm = 30.0
-        self.lr_amp_mm = 40.0
-        self.vel_mm_s = 120.0
+        self.ud_motion = 30.0
+        self.lr_motion = 40.0
+        self.vel_mm_s = 300.0
         self.acc_mm_s2 = 250.0
         self.radius_mm = 0.0
 
@@ -109,10 +109,10 @@ class DambaeRobotNode(Node):
 
             if self._last_is_dambae:
                 self.get_logger().info("✅ '담배'(True) -> UP/DOWN 5s")
-                self._move_up_down(self.duration_sec)
+                self._move_up_down()
             else:
                 self.get_logger().info("❌ NOT '담배'(False) -> LEFT/RIGHT 5s")
-                self._move_left_right(self.duration_sec)
+                self._move_left_right()
 
         except Exception as e:
             self.get_logger().error(f"Motion failed: {e}")
@@ -124,11 +124,10 @@ class DambaeRobotNode(Node):
 
     def _move_left_right(self, duration_sec: float):
         x, y, z, rx, ry, rz = self._get_center_pose()
-        left = self.posx(x, y - self.lr_amp_mm, z, rx, ry, rz)
-        right = self.posx(x, y + self.lr_amp_mm, z, rx, ry, rz)
+        left = self.posx(x, y - self.lr_motion, z, rx, ry, rz)
+        right = self.posx(x, y + self.lr_motion, z, rx, ry, rz)
         center = self.posx(x, y, z, rx, ry, rz)
 
-        start = time.time()
         for _ in range(2):  # 왕복 2번
             self.movel(left, vel=self.vel_mm_s, acc=self.acc_mm_s2, radius=self.radius_mm)
             self.movel(right, vel=self.vel_mm_s, acc=self.acc_mm_s2, radius=self.radius_mm)
@@ -139,11 +138,10 @@ class DambaeRobotNode(Node):
 
     def _move_up_down(self, duration_sec: float):
         x, y, z, rx, ry, rz = self._get_center_pose()
-        up = self.posx(x, y, z + self.ud_amp_mm, rx, ry, rz)
-        down = self.posx(x, y, z - self.ud_amp_mm, rx, ry, rz)
+        up = self.posx(x, y, z + self.ud_motion, rx, ry, rz)
+        down = self.posx(x, y, z - self.ud_motion, rx, ry, rz)
         center = self.posx(x, y, z, rx, ry, rz)
 
-        start = time.time()
         for _ in range(2):  # 왕복 2번
             self.movel(up, vel=self.vel_mm_s, acc=self.acc_mm_s2, radius=self.radius_mm)
             self.movel(down, vel=self.vel_mm_s, acc=self.acc_mm_s2, radius=self.radius_mm)
