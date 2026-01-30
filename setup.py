@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'sign_motion = cobot2.sign_motion_node:main',
             'sign_topic = cobot2.sign_topic_node:main',
+            'salute = cobot2.salute_node:main',
         ],
     },
 )
