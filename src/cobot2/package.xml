@@ -9,6 +9,8 @@
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>dsr_msgs2</depend>
   <depend>ament_index_python</depend>
 
   <buildtool_depend>ament_python</buildtool_depend>
