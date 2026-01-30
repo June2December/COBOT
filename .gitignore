@@ -1,8 +1,20 @@
+# ros2 files
 build/
 install/
 log/
-.env
-.tflite
+
+# model_path or key
+*.env
+*.tflite
 resource/.env
+
+# never upload doosan-package
+doosan-robot2
+src/doosan-robot2/
+
+# python cache
 __pycache__/
+*.pyc
+
+# editor
 .vscode/
