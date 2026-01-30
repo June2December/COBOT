@@ -6,6 +6,7 @@ string expected
 # Result
 bool success
 string heard_text
+string reason
 uint8 code
 
 ---
