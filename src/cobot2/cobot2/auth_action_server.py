@@ -6,8 +6,9 @@ from ament_index_python.packages import get_package_share_directory
 import os
 from dotenv import load_dotenv
 
-# base code STT
+# class STT, get_keyword
 from cobot2.stt import STT
+from cobot2.get_keyword import GetKeyword
 
 # user define interfaces - Auth is Authentication
 from cobot2_interfaces.action import Auth
@@ -21,7 +22,7 @@ class AuthServer(Node):
         super().__init__("auth_server")
 
         pkg = get_package_share_directory("cobot2")
-        env_path = os.path.join(pkg, "resource/.env")
+        env_path = os.path.join(pkg, "resource", ".env")
 
         if not os.path.exists(env_path):
             self.get_logger().error(f".env not found: {env_path}")
@@ -30,10 +31,12 @@ class AuthServer(Node):
 
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            self.get_logger().error("OPENAI_API_KEY not set (dotenv load failed or missing key)")
+            # self.get_logger().error("OPENAI_API_KEY not set (dotenv load failed or missing key)")
+            raise RuntimeError("OPENAI_API_KEY not set (dotenv load failed or missing key)")
 
 
         self.stt = STT(api_key)
+        self.verifier = GetKeyword(temperature=0.3)
 
         self.server = ActionServer(
             self,
@@ -118,19 +121,13 @@ class AuthServer(Node):
         fb.mode = 3
         goal_handle.publish_feedback(fb)
 
+        # if v is empty, verifier return TIMEOUT
+        v = self.verifier.verify(expected=g.expected, heard_text=heard)
+
+        res.success = bool(v["success"])
         res.heard_text = heard
-
-        if not heard:
-            res.success = False
-            res.code = 1  # TIMEOUT
-
-        elif self._norm(g.expected) in self._norm(heard):
-            res.success = True
-            res.code = 0  # OK
-
-        else:
-            res.success = False
-            res.code = 2  # MISMATCH
+        res.code = int(v["code"])
+        res.reason = str(v["reason"])
 
         goal_handle.succeed()
         return res
