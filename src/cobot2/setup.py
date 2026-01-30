@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'auth_action = cobot2.auth_action_server:main',
+            'salute = cobot2.salute_node:main',
         ],
     },
 )
