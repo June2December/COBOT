@@ -1,0 +1,8 @@
+build/
+install/
+log/
+.env
+.tflite
+resource/.env
+__pycache__/
+.vscode/
