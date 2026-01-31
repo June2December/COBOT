@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 # class STT, get_keyword
 from cobot2.stt import STT
 from cobot2.get_keyword import GetKeyword
+from cobot2.speak import speak
 
 # user define interfaces - Auth is Authentication
 from cobot2_interfaces.action import Auth
@@ -98,6 +99,7 @@ class AuthServer(Node):
         # READY
         fb.mode = 0
         goal_handle.publish_feedback(fb)
+        speak(g.challenge)
 
         # WAITING
         fb.mode = 1
