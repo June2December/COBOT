@@ -23,7 +23,7 @@ def generate_launch_description():
     host_arg = DeclareLaunchArgument("host", default_value="192.168.1.100")
 
     bringup_delay_arg = DeclareLaunchArgument("bringup_delay_sec", default_value="10.0")
-    follow_to_yolo_delay_arg = DeclareLaunchArgument("follow_to_yolo_delay_sec", default_value="5.0")
+    follow_to_yolo_delay_arg = DeclareLaunchArgument("follow_to_yolo_delay_sec", default_value="8.0")
 
     # RealSense 토픽만 넘겨받아 YOLO가 구독 (RealSense는 외부에서 이미 실행 중이어야 함)
     image_topic_arg = DeclareLaunchArgument("image_topic", default_value="/camera/camera/color/image_raw")
@@ -51,9 +51,10 @@ def generate_launch_description():
             {
                 "dry_run": False,
 
-                "startup_movej_enable": False,
-                "startup_movej_vel": 20.0,
+                "startup_movej_enable": True,
+                "startup_movej_vel": 50.0,
                 "startup_movej_acc": 20.0,
+                "startup_settle_sec": 7.0,
 
                 "error_topic": "/follow/error_norm",
                 "control_loop_hz": 15.0,

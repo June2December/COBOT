@@ -1,8 +1,9 @@
-# tcp_follow_node v0.440 2026-01-29
+# tcp_follow_node v0.700 2026-02-02
 # [이번 버전에서 수정된 사항]
-# - (변수수정) 로그 저장 기본 경로를 /home/logs 로 변경(log_dir 파라미터)
-# - (변수수정) 콘솔 출력 라벨 화이트리스트(console_labels) 추가: AUTO_SIGN/WARN/ERROR만 콘솔에 표시
-# - (유지) 라벨별 파일 저장(AUTO_SIGN/WARN/ERROR/POSE/DPOS) 및 POSE/DPOS 토픽 퍼블리시 유지
+# - (버그수정) spin 스레드에서 movej 호출 시 rclpy spin 재진입(ValueError: generator already executing) 발생 -> startup movej를 main()에서 executor.spin() 전에 1회 실행하도록 변경
+# - (기능제거) auto_sign_tune 관련 파라미터/로직 제거(튜닝 스레드/샘플링/로그 포함)
+# - (기능구현) startup_settle_sec(이동 후 안정화 대기) 추가 + startup 이후 error/필터 상태 리셋
+# - (유지) 기존 Y/Z speedl 추종 로직(EMA/deadzone/clamp/target_lost 정지) 및 디버그 posx 퍼블리시/로그 구조 유지
 
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ def initialize_robot(node: Node):
     """main()에서 노드 준비 후 1회만 호출."""
     import DSR_ROBOT2 as dr
 
+    # 일부 환경/모드에서 set_robot_mode가 거부될 수 있어 예외 무시
     try:
         dr.set_robot_mode(dr.ROBOT_MODE_AUTONOMOUS)
     except Exception:
@@ -62,7 +64,7 @@ class LabelLogger:
     라벨별 파일 저장 + (옵션) 콘솔 출력(화이트리스트).
 
     - 파일: <log_dir>/<label>.log  (label 소문자)
-    - 라벨: AUTO_SIGN / WARN / ERROR / POSE / DPOS
+    - 라벨: WARN / ERROR / POSE / DPOS  (AUTO_SIGN 제거됨)
     - 콘솔: console_labels에 포함된 라벨만 출력
     """
 
@@ -72,7 +74,6 @@ class LabelLogger:
         self._files: Dict[str, object] = {}
         os.makedirs(self._cfg.log_dir, exist_ok=True)
 
-        # 빠른 lookup
         self._console_set = set([s.upper() for s in (cfg.console_labels or [])])
 
     def _get_fp(self, label: str):
@@ -95,7 +96,7 @@ class LabelLogger:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         line = f"{ts} [{label}] {msg}"
 
-        # 콘솔: 화이트리스트 라벨만
+        # 콘솔 출력 (화이트리스트 라벨만)
         if self._cfg.log_console_enable and (label.upper() in self._console_set):
             if level == "error":
                 self._ros_logger.error(line)
@@ -104,7 +105,7 @@ class LabelLogger:
             else:
                 self._ros_logger.info(line)
 
-        # 파일: 라벨별 저장
+        # 라벨별 파일 저장
         if self._cfg.label_files_enable:
             fp = self._get_fp(label)
             fp.write(line + "\n")
@@ -113,10 +114,6 @@ class LabelLogger:
                     fp.flush()
                 except Exception:
                     pass
-
-    # Convenience
-    def auto_sign(self, msg: str):
-        self._emit("AUTO_SIGN", msg, "warn")
 
     def warn(self, msg: str):
         self._emit("WARN", msg, "warn")
@@ -146,18 +143,6 @@ class FollowParamsYZ:
     z_sign: float
 
 
-@dataclass
-class AutoTuneParams:
-    enable: bool
-    run_on_startup: bool
-    pulse_v_mm_s: float
-    pulse_duration_s: float
-    settle_s: float
-    sample_window: int
-    min_delta: float
-    apply_runtime: bool
-
-
 class RobotInterface:
     def __init__(self, node: Node, *, dry_run: bool):
         self._node = node
@@ -170,6 +155,12 @@ class RobotInterface:
             raise AttributeError("DSR_ROBOT2 missing speedl()")
 
     def movej_startup(self, joints_deg: List[float], *, vel: float, acc: float) -> None:
+        """
+        주의: DSR_ROBOT2.movej는 내부에서 spin_until_future_complete를 사용하므로
+        executor.spin()이 이미 돌아가는 상태(다른 스레드 포함)에서 호출하면
+        'generator already executing'가 날 수 있다.
+        -> main()에서 executor.spin() 전에만 호출하도록 설계.
+        """
         if self._dry_run or self._dr is None:
             return
         self._dr.movej(joints_deg, vel=vel, acc=acc)
@@ -184,6 +175,7 @@ class RobotInterface:
         if self._dry_run or self._dr is None:
             return
 
+        # DSR_ROBOT2 speedl 시그니처 호환 (환경별 차이 대응)
         try:
             self._dr.speedl(list(vel_6), acc, time_s)
             return
@@ -228,6 +220,7 @@ class TcpFollowNode(Node):
         self.declare_parameter("startup_movej_joints_deg", [0.0, 0.0, 90.0, -90.0, 0.0, 0.0])
         self.declare_parameter("startup_movej_vel", 60.0)
         self.declare_parameter("startup_movej_acc", 60.0)
+        self.declare_parameter("startup_settle_sec", 0.8)  # movej 후 안정화 대기
 
         self.declare_parameter("command_rate_hz", 40.0)
         self.declare_parameter("target_lost_timeout_sec", 0.5)
@@ -244,16 +237,6 @@ class TcpFollowNode(Node):
         self.declare_parameter("y_sign", 1.0)
         self.declare_parameter("z_sign", -1.0)
 
-        # autotune sign (Y/Z)
-        self.declare_parameter("auto_sign_tune_enable", False)
-        self.declare_parameter("auto_sign_tune_run_on_startup", True)
-        self.declare_parameter("auto_sign_pulse_v_mm_s", 40.0)
-        self.declare_parameter("auto_sign_pulse_duration_s", 0.25)
-        self.declare_parameter("auto_sign_settle_s", 0.20)
-        self.declare_parameter("auto_sign_sample_window", 10)
-        self.declare_parameter("auto_sign_min_delta", 0.01)
-        self.declare_parameter("auto_sign_apply_runtime", True)
-
         self.declare_parameter("error_topic", "/follow/error_norm")
 
         # posx monitor
@@ -267,7 +250,7 @@ class TcpFollowNode(Node):
         self.declare_parameter("log_dir", "/home/gom/logs")
         self.declare_parameter("log_console_enable", True)
         self.declare_parameter("label_files_enable", True)
-        self.declare_parameter("console_labels", ["AUTO_SIGN", "WARN", "ERROR"])
+        self.declare_parameter("console_labels", ["WARN", "ERROR"])
 
         # ---- Read params
         self._dry_run: bool = bool(self.get_parameter("dry_run").value)
@@ -276,6 +259,7 @@ class TcpFollowNode(Node):
         self._startup_movej_joints_deg: List[float] = list(self.get_parameter("startup_movej_joints_deg").value)
         self._startup_movej_vel: float = float(self.get_parameter("startup_movej_vel").value)
         self._startup_movej_acc: float = float(self.get_parameter("startup_movej_acc").value)
+        self._startup_settle_sec: float = float(self.get_parameter("startup_settle_sec").value)
 
         self._command_rate_hz: float = float(self.get_parameter("command_rate_hz").value)
         self._target_lost_timeout_sec: float = float(self.get_parameter("target_lost_timeout_sec").value)
@@ -293,17 +277,6 @@ class TcpFollowNode(Node):
             z_sign=float(self.get_parameter("z_sign").value),
         )
 
-        self._autotune = AutoTuneParams(
-            enable=bool(self.get_parameter("auto_sign_tune_enable").value),
-            run_on_startup=bool(self.get_parameter("auto_sign_tune_run_on_startup").value),
-            pulse_v_mm_s=float(self.get_parameter("auto_sign_pulse_v_mm_s").value),
-            pulse_duration_s=float(self.get_parameter("auto_sign_pulse_duration_s").value),
-            settle_s=float(self.get_parameter("auto_sign_settle_s").value),
-            sample_window=int(self.get_parameter("auto_sign_sample_window").value),
-            min_delta=float(self.get_parameter("auto_sign_min_delta").value),
-            apply_runtime=bool(self.get_parameter("auto_sign_apply_runtime").value),
-        )
-
         self._error_topic: str = str(self.get_parameter("error_topic").value)
 
         self._dbg_posx_enable: bool = bool(self.get_parameter("debug_posx_enable").value)
@@ -312,9 +285,7 @@ class TcpFollowNode(Node):
         self._dbg_posx_topic: str = str(self.get_parameter("debug_posx_topic").value)
         self._dbg_dposx_topic: str = str(self.get_parameter("debug_dposx_topic").value)
 
-        # console labels
         console_labels = [str(x).upper() for x in list(self.get_parameter("console_labels").value)]
-
         log_cfg = LabelLogConfig(
             log_dir=str(self.get_parameter("log_dir").value),
             log_console_enable=bool(self.get_parameter("log_console_enable").value),
@@ -334,10 +305,8 @@ class TcpFollowNode(Node):
         self._filt_ey: float = 0.0
         self._have_filter: bool = False
 
+        # startup: movej는 main()에서 수행, 여기서는 완료 플래그/리셋만 담당
         self._startup_done: bool = False
-        self._tuned_y_sign: Optional[float] = None
-        self._tuned_z_sign: Optional[float] = None
-        self._autotune_done: bool = False
 
         # posx monitor state
         self._posx_prev: Optional[List[float]] = None
@@ -388,25 +357,28 @@ class TcpFollowNode(Node):
     def _ema(self, prev: float, cur: float, alpha: float) -> float:
         return (1.0 - alpha) * prev + alpha * cur
 
-    def _run_startup_once(self) -> None:
+    def finalize_startup_after_movej(self) -> None:
+        """
+        main()에서 startup movej가 끝난 직후 호출.
+        - settle 대기
+        - error/필터 상태 리셋
+        - startup_done=True
+        """
         if self._startup_done:
             return
+
+        if self._startup_settle_sec > 0.0:
+            time.sleep(self._startup_settle_sec)
+
+        with self._err_lock:
+            self._latest_error_norm = None
+            self._latest_error_time_sec = 0.0
+
+        self._have_filter = False
+        self._filt_ex = 0.0
+        self._filt_ey = 0.0
+
         self._startup_done = True
-
-        if not self._startup_movej_enable:
-            return
-
-        self._robot.movej_startup(
-            self._startup_movej_joints_deg,
-            vel=self._startup_movej_vel,
-            acc=self._startup_movej_acc,
-        )
-
-    def get_y_sign(self) -> float:
-        return float(self._tuned_y_sign) if self._tuned_y_sign is not None else float(self._params.y_sign)
-
-    def get_z_sign(self) -> float:
-        return float(self._tuned_z_sign) if self._tuned_z_sign is not None else float(self._params.z_sign)
 
     # -----------------------------
     # posx monitor (POSE/DPOS) -> 파일+토픽만 (콘솔은 whitelist로 자동 차단)
@@ -449,94 +421,6 @@ class TcpFollowNode(Node):
             time.sleep(dt)
 
     # -----------------------------
-    # Minimal-log auto sign tune (AUTO_SIGN only)
-    # -----------------------------
-    def _sample_error_mean(self, n: int, dt: float) -> Optional[Tuple[float, float]]:
-        acc_ex, acc_ey = 0.0, 0.0
-        got = 0
-        for _ in range(max(1, n)):
-            if not self._target_alive():
-                return None
-            e = self._get_latest_error()
-            if e is None:
-                return None
-            ex, ey = e
-            acc_ex += ex
-            acc_ey += ey
-            got += 1
-            time.sleep(dt)
-        return (acc_ex / got, acc_ey / got) if got > 0 else None
-
-    def _send_speed_for(self, vy: float, vz: float, time_s: float, dt: float, acc: float) -> None:
-        t_end = time.time() + max(0.0, time_s)
-        cmd_time = dt * max(self._speedl_time_scale, 1.0)
-        while time.time() < t_end and rclpy.ok():
-            self._robot.speedl((0.0, vy, vz, 0.0, 0.0, 0.0), acc=acc, time_s=cmd_time)
-            time.sleep(dt)
-
-    def _auto_sign_tune_minlog(self, dt: float) -> None:
-        if not (self._autotune.enable and self._autotune.run_on_startup):
-            return
-        if self._autotune_done:
-            return
-        if not self._target_alive():
-            return
-
-        base = self._sample_error_mean(self._autotune.sample_window, dt)
-        if base is None:
-            self._autotune_done = True
-            return
-        base_ex, _ = base
-
-        self._send_speed_for(0.0, 0.0, self._autotune.settle_s, dt, self._speedl_acc)
-        self._send_speed_for(self._autotune.pulse_v_mm_s, 0.0, self._autotune.pulse_duration_s, dt, self._speedl_acc)
-        self._send_speed_for(0.0, 0.0, self._autotune.settle_s, dt, self._speedl_acc)
-
-        after = self._sample_error_mean(self._autotune.sample_window, dt)
-        if after is None:
-            self._autotune_done = True
-            return
-        after_ex, _ = after
-
-        d_ex = after_ex - base_ex
-        tuned_y = None
-        if abs(d_ex) >= self._autotune.min_delta:
-            tuned_y = -1.0 if d_ex > 0.0 else 1.0
-            if self._autotune.apply_runtime:
-                self._tuned_y_sign = tuned_y
-
-        base2 = self._sample_error_mean(self._autotune.sample_window, dt)
-        if base2 is None:
-            self._autotune_done = True
-            return
-        _, base_ey2 = base2
-
-        self._send_speed_for(0.0, 0.0, self._autotune.settle_s, dt, self._speedl_acc)
-        self._send_speed_for(0.0, self._autotune.pulse_v_mm_s, self._autotune.pulse_duration_s, dt, self._speedl_acc)
-        self._send_speed_for(0.0, 0.0, self._autotune.settle_s, dt, self._speedl_acc)
-
-        after2 = self._sample_error_mean(self._autotune.sample_window, dt)
-        if after2 is None:
-            self._autotune_done = True
-            return
-        _, after_ey2 = after2
-
-        d_ey = after_ey2 - base_ey2
-        tuned_z = None
-        if abs(d_ey) >= self._autotune.min_delta:
-            tuned_z = -1.0 if d_ey > 0.0 else 1.0
-            if self._autotune.apply_runtime:
-                self._tuned_z_sign = tuned_z
-
-        y_out = f"{tuned_y:+.0f}" if tuned_y is not None else "KEEP"
-        z_out = f"{tuned_z:+.0f}" if tuned_z is not None else "KEEP"
-        self._llog.auto_sign(f"y_sign={y_out}  (Δex={d_ex:+.3f})")
-        self._llog.auto_sign(f"z_sign={z_out}  (Δey={d_ey:+.3f})")
-
-        self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=dt * self._speedl_time_scale)
-        self._autotune_done = True
-
-    # -----------------------------
     # speedl loop
     # -----------------------------
     def spin_speedl_loop(self) -> None:
@@ -547,13 +431,11 @@ class TcpFollowNode(Node):
             threading.Thread(target=self._posx_monitor_loop, daemon=True).start()
 
         while rclpy.ok():
-            self._run_startup_once()
-
-            try:
-                self._auto_sign_tune_minlog(dt)
-            except Exception as e:
-                self._llog.error(f"auto_sign_tune failed: {e}")
-                self._autotune_done = True
+            # startup 완료 전엔 절대 추종하지 않음
+            if not self._startup_done:
+                self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
+                time.sleep(dt)
+                continue
 
             if not self._target_alive():
                 self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
@@ -582,8 +464,8 @@ class TcpFollowNode(Node):
 
             fx, fy = self._filt_ex, self._filt_ey
 
-            vy = self.get_y_sign() * (self._params.vy_mm_s_per_error * fx)
-            vz = self.get_z_sign() * (self._params.vz_mm_s_per_error * fy)
+            vy = self._params.y_sign * (self._params.vy_mm_s_per_error * fx)
+            vz = self._params.z_sign * (self._params.vz_mm_s_per_error * fy)
 
             vy = self._clamp(vy, -self._params.vmax_y_mm_s, self._params.vmax_y_mm_s)
             vz = self._clamp(vz, -self._params.vmax_z_mm_s, self._params.vmax_z_mm_s)
@@ -603,9 +485,20 @@ def main(args=None) -> None:
     try:
         dr = initialize_robot(follow_node)
         follow_node.set_dr(dr)
+
+        # ✅ 핵심: startup movej는 executor.spin() 전에만 1회 호출
+        if bool(follow_node.get_parameter("startup_movej_enable").value):
+            joints = list(follow_node.get_parameter("startup_movej_joints_deg").value)
+            vel = float(follow_node.get_parameter("startup_movej_vel").value)
+            acc = float(follow_node.get_parameter("startup_movej_acc").value)
+            follow_node._robot.movej_startup(joints, vel=vel, acc=acc)
+
+        # movej 이후 settle/리셋/스타트 완료
+        follow_node.finalize_startup_after_movej()
+
     except Exception as e:
         try:
-            follow_node._llog.error(f"robot init failed: {e}")
+            follow_node._llog.error(f"robot init/startup failed: {e}")
         except Exception:
             pass
         follow_node.destroy_node()
@@ -617,6 +510,7 @@ def main(args=None) -> None:
     executor.add_node(follow_node)
     executor.add_node(dsr_node)
 
+    # ✅ startup 완료 후에 추종 스레드 시작
     t = threading.Thread(target=follow_node.spin_speedl_loop, daemon=True)
     t.start()
 
