@@ -100,6 +100,7 @@ class AuthServer(Node):
         fb.mode = 0
         speak(g.challenge)
         goal_handle.publish_feedback(fb)
+        speak(g.challenge)
 
         # WAITING
         fb.mode = 1
