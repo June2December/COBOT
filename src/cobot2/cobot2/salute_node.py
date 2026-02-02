@@ -45,8 +45,6 @@ class SaluteRunner(Node):
         # ---- pub/sub ----
         self.sub = self.create_subscription(Bool, self.trigger_topic, self._on_trigger, 10)
         self.pub_done = self.create_publisher(Bool, self.done_topic, 10)
-        self.sub = self.create_subscription(Bool, self.trigger_topic, self._on_trigger, 10)
-        self.pub_done = self.create_publisher(Bool, self.done_topic, 10)
 
         # ---- state ----
         self._busy = False

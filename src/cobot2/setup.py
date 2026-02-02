@@ -29,6 +29,8 @@ setup(
         'console_scripts': [
             'auth_action = cobot2.auth_action_server:main',
             'salute = cobot2.salute_node:main',
+            'shoot = cobot2.shoot_node:main',
+            'main = cobot2.orchestrator:main',
         ],
     },
 )
