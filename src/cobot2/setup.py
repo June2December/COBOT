@@ -13,6 +13,8 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/resource', glob('resource/*') + ['resource/.env']),
+        ('share/' + package_name + '/resource', glob('resource/*.pt')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,10 +29,12 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'tcp_follow = cobot2.tcp_follow_node:main',
+            'yolo_camera = cobot2.yolo_camera_node:main',
             'auth_action = cobot2.auth_action_server:main',
             'salute = cobot2.salute_node:main',
             'shoot = cobot2.shoot_node:main',
-            'main = cobot2.orchestrator:main',
+            'orchestrator = cobot2.orchestrator:main',
         ],
     },
 )

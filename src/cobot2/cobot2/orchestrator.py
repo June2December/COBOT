@@ -40,7 +40,7 @@ class OrchestratorNode(Node):
         self.declare_parameter("salute_done_topic", "/salute_done")
         self.declare_parameter("shoot_trigger_topic", "/shoot_trigger")
         self.declare_parameter("shoot_done_topic", "/shoot_done")
-
+        self.declare_parameter("follow_enable_topic", "/follow/enable")
         
         # for node
         self.declare_parameter("auth_action_name", "/auth_action")
@@ -57,6 +57,7 @@ class OrchestratorNode(Node):
         self._salute_done_topic = self.get_parameter("salute_done_topic").value
         self._shoot_trigger_topic = self.get_parameter("shoot_trigger_topic").value
         self._shoot_done_topic = self.get_parameter("shoot_done_topic").value
+        self._follow_enable_topic = self.get_parameter("follow_enable_topic").value
 
         # state machine
         self._state = "IDLE"  # IDLE | AUTH | SALUTE_WAIT | SHOOT_WAIT
@@ -74,6 +75,7 @@ class OrchestratorNode(Node):
                                                    10,
                                                    callback_group=self._cbg)
         
+        self._pub_follow_enable = self.create_publisher(Bool, self._follow_enable_topic, 10)        
         # salute/shoot trigger publishers
         self._pub_salute_trigger = self.create_publisher(Bool, self._salute_trigger_topic, 10)
         self._pub_shoot_trigger = self.create_publisher(Bool, self._shoot_trigger_topic, 10)
@@ -109,7 +111,7 @@ class OrchestratorNode(Node):
         
         self._set_status("Start !!!")
         self.get_logger().info(f"expecting... {self._expected}")
-
+        self._set_follow_enable(False)
         self._try_auth()
 
     def _set_status(self, txt):
@@ -121,6 +123,7 @@ class OrchestratorNode(Node):
         if self._state != "SALUTE_WAIT":
             return
         self._set_status(f"Salute done: {'OK' if msg.data else 'FAIL'}")
+        self._set_follow_enable(True)
         self._state = "IDLE"
         self._busy = False
 
@@ -128,9 +131,9 @@ class OrchestratorNode(Node):
         if self._state != "SHOOT_WAIT":
             return
         self._set_status(f"Shoot done: {'OK' if msg.data else 'FAIL'}")
+        self._set_follow_enable(True)
         self._state = "IDLE"
         self._busy = False
-
 
     def _try_auth(self):
         self._attempts += 1
@@ -138,6 +141,7 @@ class OrchestratorNode(Node):
 
         if not self._auth.wait_for_server(timeout_sec=1.0):
             self._set_status("Auth server not available")
+            self._set_follow_enable(True)
             self._busy = False
             self._state = "IDLE"
             return
@@ -186,6 +190,9 @@ class OrchestratorNode(Node):
     def _auth_feedback(self, fb_msg):
         fb = fb_msg.feedback
         self._set_status(f"Auth mode: {fb.mode}")
+    
+    def _set_follow_enable(self, enabled: bool) -> None:
+        self._pub_follow_enable.publish(Bool(data=bool(enabled)))
 
 
 
