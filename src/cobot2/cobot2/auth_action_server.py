@@ -42,7 +42,7 @@ class AuthServer(Node):
         self.server = ActionServer(
             self,
             Auth,
-            "authentication",
+            "auth_action",
             execute_callback=self.execute_cb,
             goal_callback=self.goal_cb,
             cancel_callback=self.cancel_cb,
@@ -98,6 +98,7 @@ class AuthServer(Node):
         
         # READY
         fb.mode = 0
+        speak(g.challenge)
         goal_handle.publish_feedback(fb)
         speak(g.challenge)
 
