@@ -1,7 +1,8 @@
-# tcp_follow_node v1.000 2026-02-02
+# tcp_follow_node v1.100 2026-02-02
 # [이번 버전에서 수정된 사항]
-# - (기능구현) base Y/Z 축 절대 리미트 추가: limit_base_y_min/max_mm, limit_base_z_min/max_mm 범위 밖으로 나가려는 vy/vz를 방향별로 컷
-# - (유지) startup movej(main()에서 executor.spin 이전 1회 실행), settle/필터리셋, Y/Z speedl 추종(EMA/deadzone/clamp/target_lost) 유지
+# - (기능구현) 반응성(예민함) 상향 기본값 적용: vy/vz gain 및 vmax 상향, filter_alpha 상향, deadzone 소폭 하향
+# - (기능구현) B(=posx ry) 회전 추종 추가: ex 기반으로 speedl의 wy(각속도) 생성/클램프 후 적용(enable_b_rotation)
+# - (유지) startup movej(main()에서 executor.spin 이전 1회 실행), settle/필터리셋, Y/Z speedl 추종 및 base Y/Z 절대 리미트 유지
 # - (유지) 디버그 posx 퍼블리시/로그 구조 유지
 
 from __future__ import annotations
@@ -213,20 +214,21 @@ class TcpFollowNode(Node):
         self.declare_parameter("speedl_acc", 300.0)
         self.declare_parameter("speedl_time_scale", 1.2)
 
+        # ---- responsiveness tuned defaults (추천 1번 반영)
         self.declare_parameter("vy_mm_s_per_error", 320.0)
         self.declare_parameter("vz_mm_s_per_error", 320.0)
         self.declare_parameter("vmax_y_mm_s", 400.0)
         self.declare_parameter("vmax_z_mm_s", 400.0)
-        self.declare_parameter("deadzone_error_norm", 0.02)
+        self.declare_parameter("deadzone_error_norm", 0.015)
         self.declare_parameter("filter_alpha", 0.45)
         self.declare_parameter("y_sign", -1.0)
         self.declare_parameter("z_sign", -1.0)
 
         self.declare_parameter("error_topic", "/follow/error_norm")
 
-        # ---- base Y/Z absolute limits (NEW)
+        # ---- base Y/Z absolute limits
         self.declare_parameter("limit_base_y_enable", True)
-        self.declare_parameter("limit_base_y_min_mm", -300.0)
+        self.declare_parameter("limit_base_y_min_mm", -350.0)
         self.declare_parameter("limit_base_y_max_mm", 300.0)
 
         self.declare_parameter("limit_base_z_enable", True)
@@ -234,6 +236,12 @@ class TcpFollowNode(Node):
         self.declare_parameter("limit_base_z_max_mm", 600.0)
 
         self.declare_parameter("limit_base_yz_poll_hz", 10.0)  # posx 샘플링 주기
+
+        # ---- (NEW) B(=posx ry) rotation tracking
+        self.declare_parameter("enable_b_rotation", True)
+        self.declare_parameter("wb_deg_s_per_error", 12.0)
+        self.declare_parameter("wmax_b_deg_s", 18.0)
+        self.declare_parameter("b_sign", 1.0)
 
         # posx monitor
         self.declare_parameter("debug_posx_enable", True)
@@ -286,6 +294,12 @@ class TcpFollowNode(Node):
 
         self._limit_poll_hz: float = float(self.get_parameter("limit_base_yz_poll_hz").value)
 
+        # B rotation tracking
+        self._enable_b_rotation: bool = bool(self.get_parameter("enable_b_rotation").value)
+        self._wb_deg_s_per_error: float = float(self.get_parameter("wb_deg_s_per_error").value)
+        self._wmax_b_deg_s: float = float(self.get_parameter("wmax_b_deg_s").value)
+        self._b_sign: float = float(self.get_parameter("b_sign").value)
+
         self._dbg_posx_enable: bool = bool(self.get_parameter("debug_posx_enable").value)
         self._dbg_posx_rate_hz: float = float(self.get_parameter("debug_posx_rate_hz").value)
         self._dbg_posx_pub: bool = bool(self.get_parameter("debug_posx_pub").value)
@@ -334,10 +348,14 @@ class TcpFollowNode(Node):
 
         # sanity
         if self._limit_y_enable and (self._limit_y_min >= self._limit_y_max):
-            self._llog.warn(f"base_y_limit invalid: min({self._limit_y_min:.1f}) >= max({self._limit_y_max:.1f}) -> disabled")
+            self._llog.warn(
+                f"base_y_limit invalid: min({self._limit_y_min:.1f}) >= max({self._limit_y_max:.1f}) -> disabled"
+            )
             self._limit_y_enable = False
         if self._limit_z_enable and (self._limit_z_min >= self._limit_z_max):
-            self._llog.warn(f"base_z_limit invalid: min({self._limit_z_min:.1f}) >= max({self._limit_z_max:.1f}) -> disabled")
+            self._llog.warn(
+                f"base_z_limit invalid: min({self._limit_z_min:.1f}) >= max({self._limit_z_max:.1f}) -> disabled"
+            )
             self._limit_z_enable = False
 
     def set_dr(self, dr) -> None:
@@ -399,9 +417,19 @@ class TcpFollowNode(Node):
                     self._last_poll_t = time.time()
 
             if self._limit_y_enable:
-                self._llog.warn(f"base_y_limit ON(abs): range=[{self._limit_y_min:.1f}, {self._limit_y_max:.1f}] mm")
+                self._llog.warn(
+                    f"base_y_limit ON(abs): range=[{self._limit_y_min:.1f}, {self._limit_y_max:.1f}] mm"
+                )
             if self._limit_z_enable:
-                self._llog.warn(f"base_z_limit ON(abs): range=[{self._limit_z_min:.1f}, {self._limit_z_max:.1f}] mm")
+                self._llog.warn(
+                    f"base_z_limit ON(abs): range=[{self._limit_z_min:.1f}, {self._limit_z_max:.1f}] mm"
+                )
+
+        if self._enable_b_rotation:
+            self._llog.warn(
+                f"b_rotation ON: wb={self._wb_deg_s_per_error:.1f} deg/s per err, "
+                f"wmax={self._wmax_b_deg_s:.1f} deg/s, b_sign={self._b_sign:+.0f}"
+            )
 
         self._startup_done = True
 
@@ -446,22 +474,28 @@ class TcpFollowNode(Node):
             y = self._y_latest
             z = self._z_latest
 
-        # Y: 상한 이상에서 +방향으로 더 가려하면 컷
         if self._limit_y_enable and (y is not None):
             if (y >= self._limit_y_max) and (vy > 0.0):
-                self._throttled_limit_warn(f"base_y_limit hit: y={y:.1f} >= {self._limit_y_max:.1f} -> vy cut")
+                self._throttled_limit_warn(
+                    f"base_y_limit hit: y={y:.1f} >= {self._limit_y_max:.1f} -> vy cut"
+                )
                 vy = 0.0
             if (y <= self._limit_y_min) and (vy < 0.0):
-                self._throttled_limit_warn(f"base_y_limit hit: y={y:.1f} <= {self._limit_y_min:.1f} -> vy cut")
+                self._throttled_limit_warn(
+                    f"base_y_limit hit: y={y:.1f} <= {self._limit_y_min:.1f} -> vy cut"
+                )
                 vy = 0.0
 
-        # Z: 상한 이상에서 +방향으로 더 가려하면 컷
         if self._limit_z_enable and (z is not None):
             if (z >= self._limit_z_max) and (vz > 0.0):
-                self._throttled_limit_warn(f"base_z_limit hit: z={z:.1f} >= {self._limit_z_max:.1f} -> vz cut")
+                self._throttled_limit_warn(
+                    f"base_z_limit hit: z={z:.1f} >= {self._limit_z_max:.1f} -> vz cut"
+                )
                 vz = 0.0
             if (z <= self._limit_z_min) and (vz < 0.0):
-                self._throttled_limit_warn(f"base_z_limit hit: z={z:.1f} <= {self._limit_z_min:.1f} -> vz cut")
+                self._throttled_limit_warn(
+                    f"base_z_limit hit: z={z:.1f} <= {self._limit_z_min:.1f} -> vz cut"
+                )
                 vz = 0.0
 
         return vy, vz
@@ -551,10 +585,16 @@ class TcpFollowNode(Node):
             vy = self._clamp(vy, -self._params.vmax_y_mm_s, self._params.vmax_y_mm_s)
             vz = self._clamp(vz, -self._params.vmax_z_mm_s, self._params.vmax_z_mm_s)
 
-            # ✅ base Y/Z 절대 리미트 적용
+            # ---- (NEW) B rotation tracking (ry) uses ex
+            wy = 0.0
+            if self._enable_b_rotation:
+                wy = self._b_sign * (self._wb_deg_s_per_error * fx)
+                wy = self._clamp(wy, -self._wmax_b_deg_s, self._wmax_b_deg_s)
+
+            # base Y/Z 절대 리미트 적용
             vy, vz = self._apply_base_yz_limits(vy, vz)
 
-            self._robot.speedl((0.0, vy, vz, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
+            self._robot.speedl((0.0, vy, vz, 0.0, wy, 0.0), acc=self._speedl_acc, time_s=cmd_time)
             time.sleep(dt)
 
 
