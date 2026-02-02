@@ -1,9 +1,8 @@
-# yolo_camera_node v0.412 2026-02-02
+# yolo_camera_node v0.421 2026-02-02
 # [이번 버전에서 수정된 사항]
-# - (버그수정) model 가중치 파일 상대경로(FileNotFoundError: 'day.pt') 해결:
-#   - model 값이 절대경로가 아니면 여러 후보 경로에서 자동 탐색 후 로드
-#   - 탐색 후보: (1) 입력 그대로(절대/상대) (2) 현재 파일 폴더 (3) package share (4) workspace src 추정
-# - (유지) day_image_topic 기본값=/camera/camera/color/image_raw, 락온/유지(0.93/0.4) + tracker, error_norm, lock_done 1회 publish 유지
+# - (기능구현) aim point(px) EMA 필터 추가: aim_ema_enable/aim_ema_alpha로 마스크 중심(또는 bbox 중심) 떨림 완화
+# - (기능구현) 디버그 표시 옵션 추가: debug_draw_bbox=False로 bbox 숨기고 마스크(윤곽)만 표시 가능
+# - (유지) 락온/유지(0.93/0.4)+ByteTrack, error_norm publish, lock_done 1회 publish, 토픽 전환(시간/override), 모델 경로 자동 탐색, 마스크 centroid fallback 유지
 
 from __future__ import annotations
 
@@ -38,9 +37,10 @@ class Detection:
     x2_px: float
     y2_px: float
     track_id: Optional[int] = None
+    contour_xy: Optional[np.ndarray] = None  # shape (N,2), float32
 
     @property
-    def center_px(self) -> Tuple[float, float]:
+    def bbox_center_px(self) -> Tuple[float, float]:
         return ((self.x1_px + self.x2_px) * 0.5, (self.y1_px + self.y2_px) * 0.5)
 
     @property
@@ -58,33 +58,23 @@ def _compute_error_norm(center_px: Tuple[float, float], w: int, h: int) -> Tuple
 
 
 def _resolve_model_path(model: str, package_name: str = "cobot2") -> Tuple[str, List[str]]:
-    """
-    Ultralytics YOLO(weights) 경로를 최대한 자동으로 찾아준다.
-    - model이 절대경로면 그대로 사용
-    - 상대경로면 여러 후보를 만들어 존재하는 첫 번째를 사용
-    반환: (resolved_path, tried_paths)
-    """
     tried: List[str] = []
     model = str(model).strip()
-
     if not model:
         return model, tried
 
-    # 1) 사용자가 준 경로 그대로 (상대/절대)
     tried.append(model)
     if os.path.isabs(model) and os.path.isfile(model):
         return model, tried
     if os.path.isfile(model):
         return os.path.abspath(model), tried
 
-    # 2) 현재 파일(yolo_camera_node.py)이 있는 폴더 기준
     here_dir = os.path.dirname(os.path.abspath(__file__))
     cand = os.path.join(here_dir, model)
     tried.append(cand)
     if os.path.isfile(cand):
         return cand, tried
 
-    # 3) install/share/<pkg> 기준 (data_files로 weights를 설치했다면 여기서 잡힘)
     if get_package_share_directory is not None:
         try:
             share_dir = get_package_share_directory(package_name)
@@ -93,7 +83,6 @@ def _resolve_model_path(model: str, package_name: str = "cobot2") -> Tuple[str, 
             if os.path.isfile(cand2):
                 return cand2, tried
 
-            # 흔히 share 아래에 weights/로 넣는 경우
             cand3 = os.path.join(share_dir, "weights", model)
             tried.append(cand3)
             if os.path.isfile(cand3):
@@ -101,10 +90,6 @@ def _resolve_model_path(model: str, package_name: str = "cobot2") -> Tuple[str, 
         except Exception:
             pass
 
-    # 4) workspace src 경로 추정 (/home/<user>/<ws>/src/<pkg>/<pkg>/<model>)
-    # install/cobot2/lib/python3.10/site-packages/cobot2/.. 형태에서 ws 루트를 역으로 못 박긴 어렵지만,
-    # 흔히 /home/gom/cobot_ws/src/cobot2/cobot2 에 파일이 있으니 그 패턴을 후보로 추가
-    # (실제 경로가 다르면 launch에서 model 절대경로 권장)
     for guess in [
         os.path.expanduser(f"~/cobot_ws/src/{package_name}/{package_name}/{model}"),
         os.path.expanduser(f"~/cobot_ws/src/{package_name}/{model}"),
@@ -114,6 +99,22 @@ def _resolve_model_path(model: str, package_name: str = "cobot2") -> Tuple[str, 
             return guess, tried
 
     return model, tried
+
+
+def _centroid_from_contour(contour_xy: np.ndarray) -> Optional[Tuple[int, int, int]]:
+    """
+    contour_xy: (N,2) float -> returns (cx, cy, top_y) as ints
+    """
+    if contour_xy is None or len(contour_xy) < 3:
+        return None
+    cnt = contour_xy.astype(np.int32)
+    M = cv2.moments(cnt)
+    if M.get("m00", 0.0) == 0.0:
+        return None
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
+    top_y = int(np.min(cnt[:, 1]))
+    return cx, cy, top_y
 
 
 class YoloCameraNode(Node):
@@ -137,6 +138,7 @@ class YoloCameraNode(Node):
         # tracker
         self.declare_parameter("use_tracker", True)
         self.declare_parameter("tracker_yaml", "bytetrack.yaml")
+        self.declare_parameter("retina_masks", True)
 
         # 출력
         self.declare_parameter("publish_topic", "/follow/error_norm")
@@ -152,14 +154,33 @@ class YoloCameraNode(Node):
 
         # 시간 기반 토픽 전환
         self.declare_parameter("enable_time_based_switch", False)
-        self.declare_parameter("day_image_topic", "/camera/camera/color/image_raw")  # ✅ 원래 쓰던 토픽
+        self.declare_parameter("day_image_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("night_image_topic", "/camera/camera/infra1/image_rect_raw")
         self.declare_parameter("day_start_hms", [7, 30, 0])
         self.declare_parameter("night_start_hms", [17, 44, 0])
         self.declare_parameter("time_check_period_sec", 1.0)
 
-        # 외부 override 토픽 (String.data = 새 image_topic)
+        # 외부 override 토픽
         self.declare_parameter("image_topic_override_topic", "/follow/image_topic_override")
+
+        # -------------------------------
+        # Mask centroid mode
+        # -------------------------------
+        self.declare_parameter("use_mask_centroid", True)
+        self.declare_parameter("mask_aim_up_ratio", 0.10)
+        self.declare_parameter("mask_draw_contour", True)
+
+        # -------------------------------
+        # (NEW) Aim EMA filter
+        # -------------------------------
+        self.declare_parameter("aim_ema_enable", True)
+        self.declare_parameter("aim_ema_alpha", 0.25)  # 0.15~0.35 추천
+
+        # -------------------------------
+        # (NEW) Debug draw controls
+        # -------------------------------
+        self.declare_parameter("debug_draw_bbox", False)   # ✅ 기본: bbox 숨김
+        self.declare_parameter("debug_draw_mask", True)    # ✅ 기본: 마스크(윤곽) 표시
 
         # -------------------------------
         # Read params
@@ -175,6 +196,7 @@ class YoloCameraNode(Node):
 
         self._use_tracker: bool = bool(self.get_parameter("use_tracker").value)
         self._tracker_yaml: str = str(self.get_parameter("tracker_yaml").value)
+        self._retina_masks: bool = bool(self.get_parameter("retina_masks").value)
 
         self._publish_topic: str = str(self.get_parameter("publish_topic").value)
         self._show_debug: bool = bool(self.get_parameter("show_debug").value)
@@ -193,6 +215,16 @@ class YoloCameraNode(Node):
         self._time_check_period: float = float(self.get_parameter("time_check_period_sec").value)
 
         self._override_topic: str = str(self.get_parameter("image_topic_override_topic").value)
+
+        self._use_mask_centroid: bool = bool(self.get_parameter("use_mask_centroid").value)
+        self._mask_aim_up_ratio: float = float(self.get_parameter("mask_aim_up_ratio").value)
+        self._mask_draw_contour: bool = bool(self.get_parameter("mask_draw_contour").value)
+
+        self._aim_ema_enable: bool = bool(self.get_parameter("aim_ema_enable").value)
+        self._aim_ema_alpha: float = float(self.get_parameter("aim_ema_alpha").value)
+
+        self._debug_draw_bbox: bool = bool(self.get_parameter("debug_draw_bbox").value)
+        self._debug_draw_mask: bool = bool(self.get_parameter("debug_draw_mask").value)
 
         # -------------------------------
         # YOLO model (path resolve)
@@ -235,14 +267,24 @@ class YoloCameraNode(Node):
         self._lock_acquired_t: float = 0.0
         self._lock_done_published: bool = False
 
+        # Aim EMA state (px)
+        self._aim_ema_x: Optional[float] = None
+        self._aim_ema_y: Optional[float] = None
+
         # Debug / FPS
         self._t_prev = time.time()
         self._fps_ema = 0.0
 
+        # debug cache
+        self._dbg_last_aim_px: Optional[Tuple[int, int]] = None
+        self._dbg_last_centroid_px: Optional[Tuple[int, int]] = None
+        self._dbg_last_mode: str = "-"
+
         self.get_logger().info(
             f"[YOLO_CAMERA] ready (sub={self._image_topic}, model={self._model_path_raw} -> {self._model_path}, "
             f"target={self._target_class}, lock>={self._lock_conf_high}, keep>={self._maintain_conf_low}, "
-            f"time_switch={self._enable_time_switch}, lock_done_delay={self._lock_done_delay_sec:.2f}s)"
+            f"use_mask_centroid={self._use_mask_centroid}, aim_ema={self._aim_ema_enable} alpha={self._aim_ema_alpha:.2f}, "
+            f"draw_bbox={self._debug_draw_bbox}, draw_mask={self._debug_draw_mask})"
         )
 
     # -------------------------------
@@ -253,6 +295,11 @@ class YoloCameraNode(Node):
         self._locked_last_seen_t = 0.0
         self._lock_acquired_t = 0.0
         self._lock_done_published = False
+        self._dbg_last_aim_px = None
+        self._dbg_last_centroid_px = None
+        self._dbg_last_mode = "-"
+        self._aim_ema_x = None
+        self._aim_ema_y = None
 
     def _switch_image_topic(self, new_topic: str, *, reason: str) -> None:
         new_topic = str(new_topic).strip()
@@ -284,7 +331,6 @@ class YoloCameraNode(Node):
         now = datetime.datetime.now().time()
         day_start = datetime.time(*[int(x) for x in self._day_hms[:3]])
         night_start = datetime.time(*[int(x) for x in self._night_hms[:3]])
-
         if day_start < night_start:
             return day_start <= now < night_start
         return now >= day_start or now < night_start
@@ -321,7 +367,7 @@ class YoloCameraNode(Node):
             self.get_logger().warn("[YOLO_CAMERA] lock_done published (dummy)")
 
     # -------------------------------
-    # YOLO
+    # YOLO inference + parse
     # -------------------------------
     def _run_inference(self, frame_bgr: np.ndarray):
         if self._use_tracker:
@@ -331,12 +377,14 @@ class YoloCameraNode(Node):
                 persist=True,
                 tracker=self._tracker_yaml,
                 verbose=False,
+                retina_masks=self._retina_masks,
             )
         return self._yolo.predict(
             source=frame_bgr,
             imgsz=self._imgsz,
             conf=self._maintain_conf_low,
             verbose=False,
+            retina_masks=self._retina_masks,
         )
 
     def _extract_detections(self, result) -> List[Detection]:
@@ -345,20 +393,29 @@ class YoloCameraNode(Node):
         if boxes is None or len(boxes) == 0:
             return dets
 
-        xyxy = boxes.xyxy
-        confs = boxes.conf
-        clss = boxes.cls
-        ids = getattr(boxes, "id", None)
+        masks = getattr(result, "masks", None)
+        masks_xy = None
+        if masks is not None and hasattr(masks, "xy"):
+            masks_xy = masks.xy  # list[np.ndarray], index aligns with boxes
 
-        xyxy_np = xyxy.cpu().numpy()
-        confs_np = confs.cpu().numpy()
-        clss_np = clss.cpu().numpy()
+        xyxy_np = boxes.xyxy.cpu().numpy()
+        confs_np = boxes.conf.cpu().numpy()
+        clss_np = boxes.cls.cpu().numpy()
+        ids = getattr(boxes, "id", None)
         ids_np = ids.cpu().numpy().astype(int) if ids is not None else None
 
         for i, ((x1, y1, x2, y2), conf, cls_id) in enumerate(zip(xyxy_np, confs_np, clss_np)):
             cid = int(cls_id)
             cname = self._id_to_name.get(cid, str(cid))
             tid = int(ids_np[i]) if ids_np is not None else None
+
+            contour_xy = None
+            if masks_xy is not None:
+                try:
+                    contour_xy = np.asarray(masks_xy[i], dtype=np.float32)
+                except Exception:
+                    contour_xy = None
+
             dets.append(
                 Detection(
                     class_id=cid,
@@ -369,6 +426,7 @@ class YoloCameraNode(Node):
                     x2_px=float(x2),
                     y2_px=float(y2),
                     track_id=tid,
+                    contour_xy=contour_xy,
                 )
             )
         return dets
@@ -399,6 +457,45 @@ class YoloCameraNode(Node):
         return target
 
     # -------------------------------
+    # Aim point (mask centroid -> fallback bbox) + EMA
+    # -------------------------------
+    @staticmethod
+    def _ema(prev: float, cur: float, alpha: float) -> float:
+        return (1.0 - alpha) * prev + alpha * cur
+
+    def _apply_aim_ema(self, ax: float, ay: float) -> Tuple[float, float]:
+        if not self._aim_ema_enable:
+            return ax, ay
+        a = float(np.clip(self._aim_ema_alpha, 0.0, 1.0))
+        if self._aim_ema_x is None or self._aim_ema_y is None:
+            self._aim_ema_x, self._aim_ema_y = ax, ay
+        else:
+            self._aim_ema_x = self._ema(self._aim_ema_x, ax, a)
+            self._aim_ema_y = self._ema(self._aim_ema_y, ay, a)
+        return self._aim_ema_x, self._aim_ema_y
+
+    def _compute_aim_point(self, target: Detection) -> Tuple[Tuple[float, float], str]:
+        # A) mask centroid
+        if self._use_mask_centroid and target.contour_xy is not None and len(target.contour_xy) > 0:
+            c = _centroid_from_contour(target.contour_xy)
+            if c is not None:
+                cx, cy, top_y = c
+                height_span = max(0, cy - top_y)
+                up = float(np.clip(self._mask_aim_up_ratio, 0.0, 1.0))
+                aim_y = int(cy - (height_span * up))
+                aim_x = int(cx)
+
+                self._dbg_last_centroid_px = (cx, cy)
+                self._dbg_last_aim_px = (aim_x, aim_y)
+                return (float(aim_x), float(aim_y)), "mask"
+
+        # B) bbox fallback
+        bx, by = target.bbox_center_px
+        self._dbg_last_centroid_px = None
+        self._dbg_last_aim_px = (int(bx), int(by))
+        return (float(bx), float(by)), "bbox"
+
+    # -------------------------------
     # Image callback
     # -------------------------------
     def _on_image(self, msg: Image) -> None:
@@ -420,9 +517,18 @@ class YoloCameraNode(Node):
         target = self._pick_target_with_lock(dets_all)
 
         if target is not None:
-            ex, ey = _compute_error_norm(target.center_px, w, h)
+            (ax, ay), mode = self._compute_aim_point(target)
+            ax, ay = self._apply_aim_ema(ax, ay)
+            self._dbg_last_mode = f"{mode}+ema" if self._aim_ema_enable else mode
+
+            ex, ey = _compute_error_norm((ax, ay), w, h)
             self._publish_error(ex, ey)
         else:
+            self._dbg_last_aim_px = None
+            self._dbg_last_centroid_px = None
+            self._dbg_last_mode = "-"
+            self._aim_ema_x = None
+            self._aim_ema_y = None
             self._publish_error(0.0, 0.0)
 
         self._maybe_publish_lock_done()
@@ -430,6 +536,9 @@ class YoloCameraNode(Node):
         if self._show_debug:
             self._draw_debug(frame_bgr, target, w, h)
 
+    # -------------------------------
+    # Debug draw
+    # -------------------------------
     def _draw_debug(self, frame: np.ndarray, target: Optional[Detection], w: int, h: int) -> None:
         t = time.time()
         dt = max(1e-6, t - self._t_prev)
@@ -447,17 +556,34 @@ class YoloCameraNode(Node):
         cv2.putText(frame, done_txt, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
         if target is not None:
-            x1, y1, x2, y2 = map(int, [target.x1_px, target.y1_px, target.x2_px, target.y2_px])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            # bbox (optional)
+            if self._debug_draw_bbox:
+                x1, y1, x2, y2 = map(int, [target.x1_px, target.y1_px, target.x2_px, target.y2_px])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            cx, cy = target.center_px
-            cv2.circle(frame, (int(cx), int(cy)), 6, (0, 255, 0), -1)
+            # mask/contour (optional)
+            if self._debug_draw_mask and self._mask_draw_contour and target.contour_xy is not None and len(target.contour_xy) > 0:
+                cnt = target.contour_xy.astype(np.int32)
+                cv2.polylines(frame, [cnt], True, (0, 255, 0), 2)
 
-            ex, ey = _compute_error_norm(target.center_px, w, h)
+            # centroid + aim (optional)
+            if self._dbg_last_centroid_px is not None:
+                cx, cy = self._dbg_last_centroid_px
+                cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)  # centroid
+
+            # ema 적용 후 aim point는 float이라, 표시용으로 현재 ema 값을 사용
+            if self._dbg_last_aim_px is not None:
+                # 표시: ema 활성 시 ema 값을 우선 표시
+                if self._aim_ema_enable and (self._aim_ema_x is not None) and (self._aim_ema_y is not None):
+                    ax, ay = int(self._aim_ema_x), int(self._aim_ema_y)
+                else:
+                    ax, ay = self._dbg_last_aim_px
+                cv2.circle(frame, (ax, ay), 5, (0, 0, 255), -1)  # aim
+
             tid = target.track_id if target.track_id is not None else -1
             cv2.putText(
                 frame,
-                f"{target.class_name} id={tid} conf={target.confidence:.2f} err=({ex:+.3f},{ey:+.3f})",
+                f"{target.class_name} id={tid} conf={target.confidence:.2f} mode={self._dbg_last_mode}",
                 (10, 125),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
