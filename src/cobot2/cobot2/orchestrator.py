@@ -46,12 +46,24 @@ class OrchestratorNode(Node):
         self.declare_parameter("auth_action_name", "/auth_action")
         self.declare_parameter("auth_attempts", 3)
 
+        # trigger 기반 시작
+        self.declare_parameter("trigger_topic", "/orchestrator/trigger")
+
+        # 오늘의 암구호(문어/답어)는 여기서 주입받도록(launch에서 바꾸기 쉬움)
+        self.declare_parameter("challenge_text", "아이폰")
+        self.declare_parameter("expected_text", "갤럭시")
+
         #########################################################
 
         self._start_topic = self.get_parameter("start_topic").value
         self._status_topic = self.get_parameter("status_topic").value
         self._auth_action_name = self.get_parameter("auth_action_name").value
         self._auth_attempts = int(self.get_parameter("auth_attempts").value)
+
+        self._trigger_topic = self.get_parameter("trigger_topic").value
+        self._challenge = self.get_parameter("challenge_text").value
+        self._expected = self.get_parameter("expected_text").value
+
 
         self._salute_trigger_topic = self.get_parameter("salute_trigger_topic").value
         self._salute_done_topic = self.get_parameter("salute_done_topic").value
@@ -65,8 +77,6 @@ class OrchestratorNode(Node):
 
         self._busy = False
         self._attempts = 0
-        self._challenge = "아이폰"
-        self._expected = "갤럭시"
 
         self._pub_status = self.create_publisher(String, self._status_topic, 10) # orche 상태 출력용
         self._sub_start = self.create_subscription(String,
@@ -74,6 +84,12 @@ class OrchestratorNode(Node):
                                                    self._on_start,
                                                    10,
                                                    callback_group=self._cbg)
+        
+        self._sub_trigger = self.create_subscription(Bool,
+                                                self._trigger_topic,
+                                                self._on_trigger,
+                                                10,
+                                                callback_group=self._cbg)
         
         self._pub_follow_enable = self.create_publisher(Bool, self._follow_enable_topic, 10)        
         # salute/shoot trigger publishers
@@ -97,22 +113,43 @@ class OrchestratorNode(Node):
         if self._busy:
             self._set_status("Busy, ignoring start")
             return
-        
+
+        txt = msg.data.strip()
+        if txt:
+            self._expected = txt  # 디버그로만 override
+
+        self._start_sequence()
+
+    def _start_sequence(self):
         self._busy = True
         self._state = "AUTH"
         self._attempts = 0
-        self._expected = msg.data.strip()
 
-        if not self._expected:
-            self._set_status("Empty string...")
+        # 파라미터로 이미 self._challenge / self._expected가 세팅되어 있다고 가정합니다.
+        if not str(self._expected).strip():
+            self._set_status("Expected text is empty")
             self._busy = False
             self._state = "IDLE"
             return
-        
+
         self._set_status("Start !!!")
-        self.get_logger().info(f"expecting... {self._expected}")
+        self.get_logger().info(f"challenge='{self._challenge}', expected='{self._expected}'")
         self._set_follow_enable(False)
         self._try_auth()
+
+
+    def _on_trigger(self, msg: Bool):
+        # True일 때만 시작
+        if not msg.data:
+            return
+
+        # 중복 시작 방지
+        if self._busy:
+            self._set_status("Busy, ignoring trigger")
+            return
+
+        self._start_sequence()
+
 
     def _set_status(self, txt):
         msg = String()
