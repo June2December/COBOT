@@ -7,13 +7,12 @@ import os
 
 
 def generate_launch_description():
-    # --- Realsense (alias: realsense) ---
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
                 get_package_share_directory("realsense2_camera"),
                 "launch",
-                "rs_align_depth_launch.py",
+                "rs_launch.py",
             )
         ),
         launch_arguments={
@@ -25,7 +24,6 @@ def generate_launch_description():
             "pointcloud.enable": "true",
         }.items(),
     )
-
     # --- Doosan (alias: real) ---
     dsr_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(

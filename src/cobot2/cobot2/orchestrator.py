@@ -1,7 +1,4 @@
 """
-현재 목표: 암구호를 최대 3회 묻고 성공적으로 답어를 받으면 경례하고
-        3번 이내에 성공적 답변 듣지 못하면 더미동작 수행하는 거 해야지
-
 1. 암구호 시퀀스 최대 3회 호출
         # Goal challenge(문어), expected(답어)
         ---
@@ -11,7 +8,6 @@
     - success=True : 경례
     - success=Falsae : 더미 동작
 """
-
 # use for annotations(hint) for debug error
 from __future__ import annotations
 
@@ -125,7 +121,6 @@ class OrchestratorNode(Node):
         self._state = "AUTH"
         self._attempts = 0
 
-        # 파라미터로 이미 self._challenge / self._expected가 세팅되어 있다고 가정합니다.
         if not str(self._expected).strip():
             self._set_status("Expected text is empty")
             self._busy = False
@@ -176,7 +171,14 @@ class OrchestratorNode(Node):
         self._attempts += 1
         self._set_status(f"Authentication : {self._attempts} / {self._auth_attempts}")
 
-        if not self._auth.wait_for_server(timeout_sec=1.0):
+        ok = False
+        for i in range(5):
+            if self._auth.wait_for_server(timeout_sec=1.0):
+                ok = True
+                break
+            self._set_status(f"Waiting auth server... {i+1}/{5}")
+
+        if not ok:
             self._set_status("Auth server not available")
             self._set_follow_enable(True)
             self._busy = False
@@ -195,7 +197,9 @@ class OrchestratorNode(Node):
 
         if not goal_handle.accepted:
             self._set_status("Auth goal rejected")
+            self._set_follow_enable(True)
             self._busy = False
+            self._state = "IDLE"
             return
 
         result_future = goal_handle.get_result_async()
@@ -230,8 +234,6 @@ class OrchestratorNode(Node):
     
     def _set_follow_enable(self, enabled: bool) -> None:
         self._pub_follow_enable.publish(Bool(data=bool(enabled)))
-
-
 
 
 def main(args=None):
