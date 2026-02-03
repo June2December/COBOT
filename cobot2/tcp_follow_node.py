@@ -1,4 +1,4 @@
-# tcp_follow_node v1.110 2026-02-02
+# tcp_follow_node v1.120 2026-02-02
 # [이번 버전에서 수정된 사항]
 # - (기능구현) J4 하한 리미트 추가: J4 <= limit_j4_min_deg면 추종 명령(speedl)을 0으로 컷(hold), J4가 (min+release_margin) 이상 회복 시 자동 재개
 # - (유지) startup movej(main()에서 executor.spin 이전 1회 실행), settle/필터리셋, Y/Z speedl 추종 및 base Y/Z 절대 리미트 유지
@@ -220,23 +220,28 @@ class TcpFollowNode(Node):
         self.declare_parameter("dry_run", False)
 
         self.declare_parameter("startup_movej_enable", True)
-        self.declare_parameter("startup_movej_joints_deg", [0.0, 0.0, -90.0, 90.0, 0.0, 180.0])
+        self.declare_parameter("startup_movej_joints_deg", [-4.0, -24.82, -122.52, 175.12, -57.42, 90.0])
         self.declare_parameter("startup_movej_vel", 60.0)
         self.declare_parameter("startup_movej_acc", 60.0)
         self.declare_parameter("startup_settle_sec", 0.8)
 
-        self.declare_parameter("command_rate_hz", 40.0)
+        self.declare_parameter("command_rate_hz", 60.0)
         self.declare_parameter("target_lost_timeout_sec", 0.5)
         self.declare_parameter("speedl_acc", 300.0)
         self.declare_parameter("speedl_time_scale", 1.2)
 
         # ---- responsiveness tuned defaults
-        self.declare_parameter("vy_mm_s_per_error", 320.0)
-        self.declare_parameter("vz_mm_s_per_error", 320.0)
-        self.declare_parameter("vmax_y_mm_s", 400.0)
-        self.declare_parameter("vmax_z_mm_s", 400.0)
+        self.declare_parameter("vy_mm_s_per_error", 600.0)
+        self.declare_parameter("vz_mm_s_per_error", 600.0)
+        self.declare_parameter("vmax_y_mm_s", 600.0)
+        self.declare_parameter("vmax_z_mm_s", 600.0)
+
+        # ✅ NEW: minimum velocity (vmin)
+        self.declare_parameter("vmin_y_mm_s", 25.0)
+        self.declare_parameter("vmin_z_mm_s", 25.0)
+
         self.declare_parameter("deadzone_error_norm", 0.015)
-        self.declare_parameter("filter_alpha", 0.45)
+        self.declare_parameter("filter_alpha", 0.6)
         self.declare_parameter("y_sign", -1.0)
         self.declare_parameter("z_sign", -1.0)
 
@@ -257,6 +262,8 @@ class TcpFollowNode(Node):
         self.declare_parameter("enable_b_rotation", False)
         self.declare_parameter("wb_deg_s_per_error", 12.0)
         self.declare_parameter("wmax_b_deg_s", 18.0)
+        # ✅ NEW
+        self.declare_parameter("vmin_b_deg_s", 5.0)
         self.declare_parameter("b_sign", 1.0)
 
         # ---- (NEW) J4 limit
@@ -291,6 +298,10 @@ class TcpFollowNode(Node):
         self._target_lost_timeout_sec: float = float(self.get_parameter("target_lost_timeout_sec").value)
         self._speedl_acc: float = float(self.get_parameter("speedl_acc").value)
         self._speedl_time_scale: float = float(self.get_parameter("speedl_time_scale").value)
+
+        self._vmin_y_mm_s: float = float(self.get_parameter("vmin_y_mm_s").value)
+        self._vmin_z_mm_s: float = float(self.get_parameter("vmin_z_mm_s").value)
+        self._vmin_b_deg_s: float = float(self.get_parameter("vmin_b_deg_s").value)
 
         self._params = FollowParamsYZ(
             vy_mm_s_per_error=float(self.get_parameter("vy_mm_s_per_error").value),
@@ -424,6 +435,12 @@ class TcpFollowNode(Node):
     @staticmethod
     def _clamp(v: float, lo: float, hi: float) -> float:
         return lo if v < lo else hi if v > hi else v
+    
+    @staticmethod
+    def _apply_vmin(v: float, vmin: float) -> float:
+        if abs(v) < 1e-6:
+            return 0.0
+        return v if abs(v) >= vmin else (vmin if v > 0.0 else -vmin)
 
     def _ema(self, prev: float, cur: float, alpha: float) -> float:
         return (1.0 - alpha) * prev + alpha * cur
@@ -689,6 +706,10 @@ class TcpFollowNode(Node):
 
             vy = self._clamp(vy, -self._params.vmax_y_mm_s, self._params.vmax_y_mm_s)
             vz = self._clamp(vz, -self._params.vmax_z_mm_s, self._params.vmax_z_mm_s)
+
+            # NEWWWWWWWWWW
+            vy = self._apply_vmin(vy, self._vmin_y_mm_s)
+            vz = self._apply_vmin(vz, self._vmin_z_mm_s)
 
             wy = 0.0
             if self._enable_b_rotation:
