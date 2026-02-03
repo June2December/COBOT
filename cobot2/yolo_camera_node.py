@@ -127,7 +127,7 @@ class YoloCameraNode(Node):
         # Parameters (기본)
         # -------------------------------
         self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
-        self.declare_parameter("model", "day.pt")
+        self.declare_parameter("model", "night.pt")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("target_class_name", "person")
 

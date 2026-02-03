@@ -162,21 +162,12 @@ class RobotInterface:
     ) -> None:
         if self._dry_run or self._dr is None:
             return
-
+            
         try:
             self._dr.speedl(list(vel_6), acc, time_s)
             return
         except TypeError:
             pass
-
-        try:
-            self._dr.speedl(vel=list(vel_6), acc=acc, time=time_s)
-            return
-        except TypeError:
-            pass
-
-        acc6 = [float(acc)] * 6
-        self._dr.speedl(list(vel_6), acc6, time_s)
 
     def get_current_posx(self):
         if self._dry_run or self._dr is None:
@@ -225,7 +216,7 @@ class TcpFollowNode(Node):
         self.declare_parameter("startup_movej_acc", 60.0)
         self.declare_parameter("startup_settle_sec", 0.8)
 
-        self.declare_parameter("command_rate_hz", 60.0)
+        self.declare_parameter("command_rate_hz", 40.0)
         self.declare_parameter("target_lost_timeout_sec", 0.5)
         self.declare_parameter("speedl_acc", 300.0)
         self.declare_parameter("speedl_time_scale", 1.2)
@@ -249,14 +240,14 @@ class TcpFollowNode(Node):
 
         # ---- base Y/Z absolute limits
         self.declare_parameter("limit_base_y_enable", True)
-        self.declare_parameter("limit_base_y_min_mm", -300.0)
-        self.declare_parameter("limit_base_y_max_mm", 300.0)
+        self.declare_parameter("limit_base_y_min_mm", -500.0)
+        self.declare_parameter("limit_base_y_max_mm", 500.0)
 
         self.declare_parameter("limit_base_z_enable", True)
         self.declare_parameter("limit_base_z_min_mm", 200.0)
         self.declare_parameter("limit_base_z_max_mm", 600.0)
 
-        self.declare_parameter("limit_base_yz_poll_hz", 10.0)
+        self.declare_parameter("limit_base_yz_poll_hz", 40.0)
 
         # ---- B(=posx ry) rotation tracking
         self.declare_parameter("enable_b_rotation", False)
@@ -274,7 +265,7 @@ class TcpFollowNode(Node):
 
         # posx monitor
         self.declare_parameter("debug_posx_enable", True)
-        self.declare_parameter("debug_posx_rate_hz", 10.0)
+        self.declare_parameter("debug_posx_rate_hz", 40.0)
         self.declare_parameter("debug_posx_pub", True)
         self.declare_parameter("debug_posx_topic", "/follow/posx_debug")
         self.declare_parameter("debug_dposx_topic", "/follow/dposx_debug")
