@@ -91,7 +91,7 @@ def generate_launch_description():
         output="screen",
         parameters=[
             {
-                "image_topic": LaunchConfiguration("image_topic"),
+                # "image_topic": LaunchConfiguration("image_topic"),
                 "target_class_name": "person",
                 "min_confidence": 0.6,
                 "publish_topic": "/follow/error_norm",

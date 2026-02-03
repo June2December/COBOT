@@ -1,5 +1,6 @@
-# yolo_camera_node v0.421 2026-02-02
+# yolo_camera_node v0.430 2026-02-02
 # [이번 버전에서 수정된 사항]
+# - (기능구현) Lock done 이벤트 로그 추가
 # - (기능구현) aim point(px) EMA 필터 추가: aim_ema_enable/aim_ema_alpha로 마스크 중심(또는 bbox 중심) 떨림 완화
 # - (기능구현) 디버그 표시 옵션 추가: debug_draw_bbox=False로 bbox 숨기고 마스크(윤곽)만 표시 가능
 # - (유지) 락온/유지(0.93/0.4)+ByteTrack, error_norm publish, lock_done 1회 publish, 토픽 전환(시간/override), 모델 경로 자동 탐색, 마스크 centroid fallback 유지
@@ -135,6 +136,9 @@ class YoloCameraNode(Node):
         self.declare_parameter("maintain_conf_low", 0.4)
         self.declare_parameter("lost_timeout_sec", 0.6)
 
+        # ✅ LOCK_DONE error threshold (NEW)
+        self.declare_parameter("lock_done_error_thresh", 0.15)
+
         # tracker
         self.declare_parameter("use_tracker", True)
         self.declare_parameter("tracker_yaml", "bytetrack.yaml")
@@ -152,12 +156,13 @@ class YoloCameraNode(Node):
         self.declare_parameter("lock_done_topic", "/follow/lock_done")
         self.declare_parameter("lock_done_delay_sec", 1.0)
 
+
         # 시간 기반 토픽 전환
-        self.declare_parameter("enable_time_based_switch", False)
+        self.declare_parameter("enable_time_based_switch", True)
         self.declare_parameter("day_image_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("night_image_topic", "/camera/camera/infra1/image_rect_raw")
         self.declare_parameter("day_start_hms", [7, 30, 0])
-        self.declare_parameter("night_start_hms", [17, 44, 0])
+        self.declare_parameter("night_start_hms", [17, 46, 0])
         self.declare_parameter("time_check_period_sec", 1.0)
 
         # 외부 override 토픽
@@ -193,6 +198,11 @@ class YoloCameraNode(Node):
         self._lock_conf_high: float = float(self.get_parameter("lock_conf_high").value)
         self._maintain_conf_low: float = float(self.get_parameter("maintain_conf_low").value)
         self._lost_timeout_sec: float = float(self.get_parameter("lost_timeout_sec").value)
+
+        # ✅ NEW
+        self._lock_done_err_th: float = float(
+            self.get_parameter("lock_done_error_thresh").value
+        )
 
         self._use_tracker: bool = bool(self.get_parameter("use_tracker").value)
         self._tracker_yaml: str = str(self.get_parameter("tracker_yaml").value)
@@ -239,6 +249,8 @@ class YoloCameraNode(Node):
                 self.get_logger().error(f"  - {p}")
             raise FileNotFoundError(f"model file not found: {self._model_path_raw}")
 
+        # [추가] 모폴로지 연산용 커널 (노이즈 제거용 5x5)
+        self._morph_kernel = np.ones((5, 5), np.uint8)
         self.get_logger().info(f"[YOLO_CAMERA] loading model: {self._model_path}")
         self._yolo = YOLO(self._model_path)
 
@@ -266,6 +278,10 @@ class YoloCameraNode(Node):
         self._locked_last_seen_t: float = 0.0
         self._lock_acquired_t: float = 0.0
         self._lock_done_published: bool = False
+
+        # ✅ Last error for lock-done gating (NEW)
+        self._last_ex: Optional[float] = None
+        self._last_ey: Optional[float] = None
 
         # Aim EMA state (px)
         self._aim_ema_x: Optional[float] = None
@@ -361,10 +377,26 @@ class YoloCameraNode(Node):
             return
         if self._locked_id is None or self._lock_acquired_t <= 0.0:
             return
-        if (time.time() - self._lock_acquired_t) >= max(0.0, self._lock_done_delay_sec):
+        if self._last_ex is None or self._last_ey is None:
+            return
+
+        # ✅ 추가 조건: 중심 근접
+        if abs(self._last_ex) > self._lock_done_err_th:
+            return
+        if abs(self._last_ey) > self._lock_done_err_th:
+            return
+
+        held = time.time() - self._lock_acquired_t
+        if held >= self._lock_done_delay_sec:
             self._pub_lock_done.publish(Bool(data=True))
             self._lock_done_published = True
-            self.get_logger().warn("[YOLO_CAMERA] lock_done published (dummy)")
+
+            self.get_logger().warn(
+                f"[LOCK_DONE] id={self._locked_id} "
+                f"held={held:.2f}s "
+                f"err=({self._last_ex:.2f},{self._last_ey:.2f}) "
+                f"topic={self._image_topic}"
+            )
 
     # -------------------------------
     # YOLO inference + parse
@@ -386,8 +418,34 @@ class YoloCameraNode(Node):
             verbose=False,
             retina_masks=self._retina_masks,
         )
+    def _refine_mask(self, mask_raw: np.ndarray, h: int, w: int) -> Optional[np.ndarray]:
+        """
+        [노이즈 제거] 마스크를 비트맵으로 그리고, 튀어나온 가시를 깎아낸 뒤(Open), 다시 윤곽선을 땀
+        """
+        # 1. 캔버스에 그리기
+        mask_img = np.zeros((h, w), dtype=np.uint8)
+        pts = mask_raw.astype(np.int32)
+        cv2.fillPoly(mask_img, [pts], 255)
 
-    def _extract_detections(self, result) -> List[Detection]:
+        # 2. 모폴로지 연산 (Opening: 깎아내기 -> 다시 불리기) -> 튀어나온 노이즈 제거
+        mask_clean = cv2.morphologyEx(mask_img, cv2.MORPH_OPEN, self._morph_kernel)
+
+        # 3. 윤곽선 다시 추출
+        contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return None
+        
+        # 가장 큰 덩어리만 선택
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        if cv2.contourArea(largest_contour) < 50: # 너무 작으면 무시
+            return None
+            
+        return largest_contour.reshape(-1, 2)
+
+    # [수정됨] 인자에 h, w 추가됨
+    def _extract_detections(self, result, h: int, w: int) -> List[Detection]:
         dets: List[Detection] = []
         boxes = getattr(result, "boxes", None)
         if boxes is None or len(boxes) == 0:
@@ -396,7 +454,7 @@ class YoloCameraNode(Node):
         masks = getattr(result, "masks", None)
         masks_xy = None
         if masks is not None and hasattr(masks, "xy"):
-            masks_xy = masks.xy  # list[np.ndarray], index aligns with boxes
+            masks_xy = masks.xy
 
         xyxy_np = boxes.xyxy.cpu().numpy()
         confs_np = boxes.conf.cpu().numpy()
@@ -412,7 +470,10 @@ class YoloCameraNode(Node):
             contour_xy = None
             if masks_xy is not None:
                 try:
-                    contour_xy = np.asarray(masks_xy[i], dtype=np.float32)
+                    raw_mask = np.asarray(masks_xy[i], dtype=np.float32)
+                    if len(raw_mask) > 0:
+                        # [핵심] 여기서 위에서 만든 _refine_mask를 호출해 노이즈를 제거함
+                        contour_xy = self._refine_mask(raw_mask, h, w)
                 except Exception:
                     contour_xy = None
 
@@ -513,7 +574,7 @@ class YoloCameraNode(Node):
         results = self._run_inference(frame_bgr)
         result0 = results[0]
 
-        dets_all = self._extract_detections(result0)
+        dets_all = self._extract_detections(result0, h, w)
         target = self._pick_target_with_lock(dets_all)
 
         if target is not None:
@@ -523,6 +584,8 @@ class YoloCameraNode(Node):
 
             ex, ey = _compute_error_norm((ax, ay), w, h)
             self._publish_error(ex, ey)
+            self._last_ex = ex
+            self._last_ey = ey
         else:
             self._dbg_last_aim_px = None
             self._dbg_last_centroid_px = None
