@@ -7,23 +7,23 @@ import os
 
 
 def generate_launch_description():
-    realsense_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory("realsense2_camera"),
-                "launch",
-                "rs_launch.py",
-            )
-        ),
-        launch_arguments={
-            "depth_module.depth_profile": "640x480x30",
-            "rgb_camera.color_profile": "640x480x30",
-            "initial_reset": "true",
-            "align_depth.enable": "true",
-            "enable_rgbd": "true",
-            "pointcloud.enable": "true",
-        }.items(),
-    )
+    # realsense_launch = IncludeLaunchDescription(
+    #     PythonLaunchDescriptionSource(
+    #         os.path.join(
+    #             get_package_share_directory("realsense2_camera"),
+    #             "launch",
+    #             "rs_launch.py",
+    #         )
+    #     ),
+    #     launch_arguments={
+    #         "depth_module.depth_profile": "640x480x30",
+    #         "rgb_camera.color_profile": "640x480x30",
+    #         "initial_reset": "true",
+    #         "align_depth.enable": "true",
+    #         "enable_rgbd": "true",
+    #         "pointcloud.enable": "true",
+    #     }.items(),
+    # )
     # --- Doosan (alias: real) ---
     dsr_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -44,7 +44,7 @@ def generate_launch_description():
     return LaunchDescription(
         [
             # --- Hardware bringup ---
-            realsense_launch,
+            # realsense_launch,
             dsr_launch,
 
             # --- Perception ---
@@ -53,7 +53,11 @@ def generate_launch_description():
                 executable="yolo_camera",
                 name="yolo_camera_node",
                 output="screen",
-                # parameters=[{}],  # 필요 시 추가
+                parameters=[
+                    {
+                        "image_topic": "/camera/camera/color/image_raw",
+                        "show_debug": True,
+                    }]
             ),
 
             # --- Follow control ---

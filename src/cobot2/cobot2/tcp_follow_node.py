@@ -1,11 +1,4 @@
-# tcp_follow_node v1.000 2026-02-02
-# [이번 버전에서 수정된 사항]
-# - (기능구현) base Y/Z 축 절대 리미트 추가: limit_base_y_min/max_mm, limit_base_z_min/max_mm 범위 밖으로 나가려는 vy/vz를 방향별로 컷
-# - (유지) startup movej(main()에서 executor.spin 이전 1회 실행), settle/필터리셋, Y/Z speedl 추종(EMA/deadzone/clamp/target_lost) 유지
-# - (유지) 디버그 posx 퍼블리시/로그 구조 유지
-
 from __future__ import annotations
-
 import os
 import time
 import threading
@@ -18,7 +11,6 @@ from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Bool
 
 import DR_init
-
 # ==========================================================
 # ROBOT constants
 # ==========================================================
@@ -43,7 +35,6 @@ def initialize_robot(node: Node):
     dr.set_tool(ROBOT_TOOL)
     dr.set_tcp(ROBOT_TCP)
     return dr
-
 
 # ==========================================================
 # Follow params
@@ -117,6 +108,22 @@ class RobotInterface:
         except Exception:
             return None
 
+    def get_current_posj(self):
+        """Return current joint angles [j1..j6] deg if available, else None."""
+        if self._dry_run or self._dr is None:
+            return None
+        if not hasattr(self._dr, "get_current_posj"):
+            return None
+        try:
+            out = self._dr.get_current_posj()
+            if isinstance(out, (list, tuple)) and len(out) > 0:
+                if isinstance(out[0], (list, tuple)) and len(out[0]) >= 6:
+                    return [float(x) for x in out[0][:6]]
+                if len(out) >= 6 and isinstance(out[0], (int, float)):
+                    return [float(x) for x in out[:6]]
+            return None
+        except Exception:
+            return None
 
 class TcpFollowNode(Node):
     def __init__(self) -> None:
@@ -126,40 +133,61 @@ class TcpFollowNode(Node):
         self.declare_parameter("dry_run", False)
 
         self.declare_parameter("startup_movej_enable", True)
-        self.declare_parameter("startup_movej_joints_deg", [0.0, 0.0, -90.0, 90.0, 0.0, 180.0])
+        self.declare_parameter("startup_movej_joints_deg", [-4.0, -24.82, -122.52, 175.12, -57.42, 90.0])
         self.declare_parameter("startup_movej_vel", 60.0)
         self.declare_parameter("startup_movej_acc", 60.0)
         self.declare_parameter("startup_settle_sec", 0.8)
 
-        self.declare_parameter("command_rate_hz", 40.0)
+        self.declare_parameter("command_rate_hz", 60.0)
         self.declare_parameter("target_lost_timeout_sec", 0.5)
         self.declare_parameter("speedl_acc", 300.0)
         self.declare_parameter("speedl_time_scale", 1.2)
 
-        self.declare_parameter("vy_mm_s_per_error", 320.0)
-        self.declare_parameter("vz_mm_s_per_error", 320.0)
-        self.declare_parameter("vmax_y_mm_s", 400.0)
-        self.declare_parameter("vmax_z_mm_s", 400.0)
-        self.declare_parameter("deadzone_error_norm", 0.02)
-        self.declare_parameter("filter_alpha", 0.45)
+        # ---- responsiveness tuned defaults
+        self.declare_parameter("vy_mm_s_per_error", 600.0)
+        self.declare_parameter("vz_mm_s_per_error", 600.0)
+        self.declare_parameter("vmax_y_mm_s", 600.0)
+        self.declare_parameter("vmax_z_mm_s", 600.0)
+
+        # ✅ NEW: minimum velocity (vmin)
+        self.declare_parameter("vmin_y_mm_s", 25.0)
+        self.declare_parameter("vmin_z_mm_s", 25.0)
+
+        self.declare_parameter("deadzone_error_norm", 0.015)
+        self.declare_parameter("filter_alpha", 0.6)
         self.declare_parameter("y_sign", -1.0)
         self.declare_parameter("z_sign", -1.0)
 
         self.declare_parameter("error_topic", "/follow/error_norm")
+
         self.declare_parameter("enable_topic", "/follow/enable")
-        self.declare_parameter("follow_enable_default", True)
+        self.declare_parameter("follow_enable_default", False)
 
 
-        # ---- base Y/Z absolute limits (NEW)
+        # ---- base Y/Z absolute limits
         self.declare_parameter("limit_base_y_enable", True)
         self.declare_parameter("limit_base_y_min_mm", -300.0)
         self.declare_parameter("limit_base_y_max_mm", 300.0)
 
         self.declare_parameter("limit_base_z_enable", True)
-        self.declare_parameter("limit_base_z_min_mm", 400.0)
+        self.declare_parameter("limit_base_z_min_mm", 200.0)
         self.declare_parameter("limit_base_z_max_mm", 600.0)
 
-        self.declare_parameter("limit_base_yz_poll_hz", 10.0)  # posx 샘플링 주기
+        self.declare_parameter("limit_base_yz_poll_hz", 10.0)
+
+        # ---- B(=posx ry) rotation tracking
+        self.declare_parameter("enable_b_rotation", False)
+        self.declare_parameter("wb_deg_s_per_error", 12.0)
+        self.declare_parameter("wmax_b_deg_s", 18.0)
+        # ✅ NEW
+        self.declare_parameter("vmin_b_deg_s", 5.0)
+        self.declare_parameter("b_sign", 1.0)
+
+        # ---- (NEW) J4 limit
+        self.declare_parameter("limit_j4_enable", True)
+        self.declare_parameter("limit_j4_min_deg", -80.0)
+        self.declare_parameter("limit_j4_release_margin_deg", 2.0)  # -78도 이상에서 해제(기본)
+        self.declare_parameter("limit_j4_poll_hz", 20.0)
 
         # posx monitor
         self.declare_parameter("debug_posx_enable", True)
@@ -167,7 +195,6 @@ class TcpFollowNode(Node):
         self.declare_parameter("debug_posx_pub", True)
         self.declare_parameter("debug_posx_topic", "/follow/posx_debug")
         self.declare_parameter("debug_dposx_topic", "/follow/dposx_debug")
-
         # ---- Read params
         self._dry_run: bool = bool(self.get_parameter("dry_run").value)
 
@@ -177,15 +204,14 @@ class TcpFollowNode(Node):
         self._startup_movej_acc: float = float(self.get_parameter("startup_movej_acc").value)
         self._startup_settle_sec: float = float(self.get_parameter("startup_settle_sec").value)
 
-        self._enable_topic: str = str(self.get_parameter("enable_topic").value)
-        self._follow_enabled: bool = bool(self.get_parameter("follow_enable_default").value)
-        self._enable_lock = threading.Lock()
-
-
         self._command_rate_hz: float = float(self.get_parameter("command_rate_hz").value)
         self._target_lost_timeout_sec: float = float(self.get_parameter("target_lost_timeout_sec").value)
         self._speedl_acc: float = float(self.get_parameter("speedl_acc").value)
         self._speedl_time_scale: float = float(self.get_parameter("speedl_time_scale").value)
+
+        self._vmin_y_mm_s: float = float(self.get_parameter("vmin_y_mm_s").value)
+        self._vmin_z_mm_s: float = float(self.get_parameter("vmin_z_mm_s").value)
+        self._vmin_b_deg_s: float = float(self.get_parameter("vmin_b_deg_s").value)
 
         self._params = FollowParamsYZ(
             vy_mm_s_per_error=float(self.get_parameter("vy_mm_s_per_error").value),
@@ -200,7 +226,11 @@ class TcpFollowNode(Node):
 
         self._error_topic: str = str(self.get_parameter("error_topic").value)
 
-        # limits
+        self._enable_topic: str = str(self.get_parameter("enable_topic").value)
+        self._follow_enabled: bool = bool(self.get_parameter("follow_enable_default").value)
+
+
+        # limits (base y/z)
         self._limit_y_enable: bool = bool(self.get_parameter("limit_base_y_enable").value)
         self._limit_y_min: float = float(self.get_parameter("limit_base_y_min_mm").value)
         self._limit_y_max: float = float(self.get_parameter("limit_base_y_max_mm").value)
@@ -210,6 +240,18 @@ class TcpFollowNode(Node):
         self._limit_z_max: float = float(self.get_parameter("limit_base_z_max_mm").value)
 
         self._limit_poll_hz: float = float(self.get_parameter("limit_base_yz_poll_hz").value)
+
+        # B rotation tracking
+        self._enable_b_rotation: bool = bool(self.get_parameter("enable_b_rotation").value)
+        self._wb_deg_s_per_error: float = float(self.get_parameter("wb_deg_s_per_error").value)
+        self._wmax_b_deg_s: float = float(self.get_parameter("wmax_b_deg_s").value)
+        self._b_sign: float = float(self.get_parameter("b_sign").value)
+
+        # J4 limit
+        self._limit_j4_enable: bool = bool(self.get_parameter("limit_j4_enable").value)
+        self._limit_j4_min_deg: float = float(self.get_parameter("limit_j4_min_deg").value)
+        self._limit_j4_release_margin_deg: float = float(self.get_parameter("limit_j4_release_margin_deg").value)
+        self._limit_j4_poll_hz: float = float(self.get_parameter("limit_j4_poll_hz").value)
 
         self._dbg_posx_enable: bool = bool(self.get_parameter("debug_posx_enable").value)
         self._dbg_posx_rate_hz: float = float(self.get_parameter("debug_posx_rate_hz").value)
@@ -232,15 +274,19 @@ class TcpFollowNode(Node):
         self._posx_prev: Optional[List[float]] = None
         self._posx_prev_t: Optional[float] = None
 
-        # limit runtime state
+        # limit runtime state (base y/z)
         self._lim_lock = threading.Lock()
         self._y_latest: Optional[float] = None
         self._z_latest: Optional[float] = None
         self._last_poll_t: float = 0.0
-        self._warn_t: float = 0.0
+
+        # limit runtime state (J4)
+        self._j_lock = threading.Lock()
+        self._j4_latest: Optional[float] = None
+        self._j_last_poll_t: float = 0.0
+        self._j4_hold_active: bool = False
 
         self.create_subscription(Float32MultiArray, self._error_topic, self._on_error_norm, 10)
-
         self.create_subscription(Bool, self._enable_topic, self._on_enable, 10)
 
         if self._dbg_posx_pub:
@@ -250,11 +296,21 @@ class TcpFollowNode(Node):
             self._pub_posx = None
             self._pub_dposx = None
 
+        # sanity
+        if self._limit_y_enable and (self._limit_y_min >= self._limit_y_max):
+            self._limit_y_enable = False
+        if self._limit_z_enable and (self._limit_z_min >= self._limit_z_max):
+            self._limit_z_enable = False
+
     def set_dr(self, dr) -> None:
         self._robot.set_dr(dr)
 
     def destroy_node(self):
         super().destroy_node()
+    
+    def _on_enable(self, msg) -> None:
+        self._follow_enabled = bool(msg.data)
+
 
     def _on_error_norm(self, msg: Float32MultiArray) -> None:
         if len(msg.data) < 2:
@@ -273,15 +329,16 @@ class TcpFollowNode(Node):
     def _get_latest_error(self) -> Optional[Tuple[float, float]]:
         with self._err_lock:
             return self._latest_error_norm
-    
-    def _on_enable(self, msg: Bool) -> None:
-        with self._enable_lock:
-            self._follow_enabled = bool(msg.data)
-
 
     @staticmethod
     def _clamp(v: float, lo: float, hi: float) -> float:
         return lo if v < lo else hi if v > hi else v
+    
+    @staticmethod
+    def _apply_vmin(v: float, vmin: float) -> float:
+        if abs(v) < 1e-6:
+            return 0.0
+        return v if abs(v) >= vmin else (vmin if v > 0.0 else -vmin)
 
     def _ema(self, prev: float, cur: float, alpha: float) -> float:
         return (1.0 - alpha) * prev + alpha * cur
@@ -300,7 +357,7 @@ class TcpFollowNode(Node):
         self._filt_ex = 0.0
         self._filt_ey = 0.0
 
-        # prime Y/Z latest
+        # prime base y/z latest
         if self._limit_y_enable or self._limit_z_enable:
             posx = self._robot.get_current_posx()
             if posx is not None and len(posx) >= 3:
@@ -310,6 +367,9 @@ class TcpFollowNode(Node):
                     self._last_poll_t = time.time()
         self._startup_done = True
 
+    # -----------------------------
+    # base y/z polling + limit
+    # -----------------------------
     def _poll_base_yz_if_needed(self) -> None:
         if not (self._limit_y_enable or self._limit_z_enable):
             return
@@ -343,14 +403,12 @@ class TcpFollowNode(Node):
             y = self._y_latest
             z = self._z_latest
 
-        # Y: 상한 이상에서 +방향으로 더 가려하면 컷
         if self._limit_y_enable and (y is not None):
             if (y >= self._limit_y_max) and (vy > 0.0):
                 vy = 0.0
             if (y <= self._limit_y_min) and (vy < 0.0):
                 vy = 0.0
 
-        # Z: 상한 이상에서 +방향으로 더 가려하면 컷
         if self._limit_z_enable and (z is not None):
             if (z >= self._limit_z_max) and (vz > 0.0):
                 vz = 0.0
@@ -359,6 +417,63 @@ class TcpFollowNode(Node):
 
         return vy, vz
 
+    # -----------------------------
+    # J4 polling + hold limit
+    # -----------------------------
+    def _poll_j4_if_needed(self) -> None:
+        if not self._limit_j4_enable:
+            return
+        if self._limit_j4_poll_hz <= 0.0:
+            return
+
+        now = time.time()
+        dt_need = 1.0 / max(self._limit_j4_poll_hz, 1e-3)
+
+        with self._j_lock:
+            last = self._j_last_poll_t
+        if (now - last) < dt_need:
+            return
+
+        posj = self._robot.get_current_posj()
+        if posj is None or len(posj) < 4:
+            return
+
+        j4 = float(posj[3])  # J4
+        with self._j_lock:
+            self._j4_latest = j4
+            self._j_last_poll_t = now
+
+    def _apply_j4_limit_hold(self, vy: float, vz: float, wy: float) -> Tuple[float, float, float]:
+        if not self._limit_j4_enable:
+            return vy, vz, wy
+
+        with self._j_lock:
+            j4 = self._j4_latest
+            hold = self._j4_hold_active
+
+        if j4 is None:
+            return vy, vz, wy
+
+        min_deg = float(self._limit_j4_min_deg)
+        release_deg = min_deg + max(0.0, float(self._limit_j4_release_margin_deg))
+
+        if hold:
+            if j4 >= release_deg:
+                with self._j_lock:
+                    self._j4_hold_active = False
+                return vy, vz, wy
+            return 0.0, 0.0, 0.0
+
+        if j4 <= min_deg:
+            with self._j_lock:
+                self._j4_hold_active = True
+            return 0.0, 0.0, 0.0
+
+        return vy, vz, wy
+
+    # -----------------------------
+    # posx monitor (POSE/DPOS)
+    # -----------------------------
     def _posx_monitor_loop(self):
         dt = 1.0 / max(self._dbg_posx_rate_hz, 1.0)
         while rclpy.ok():
@@ -389,6 +504,9 @@ class TcpFollowNode(Node):
 
             time.sleep(dt)
 
+    # -----------------------------
+    # speedl loop
+    # -----------------------------
     def spin_speedl_loop(self) -> None:
         dt = 1.0 / max(self._command_rate_hz, 1.0)
         cmd_time = dt * max(self._speedl_time_scale, 1.0)
@@ -397,20 +515,17 @@ class TcpFollowNode(Node):
             threading.Thread(target=self._posx_monitor_loop, daemon=True).start()
 
         while rclpy.ok():
-            with self._enable_lock:
-                enabled = self._follow_enabled
-
-            if not enabled:
+            if not self._startup_done:
                 self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
                 time.sleep(dt)
                 continue
-
-            if not self._startup_done:
+            if not self._follow_enabled:
                 self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
                 time.sleep(dt)
                 continue
 
             self._poll_base_yz_if_needed()
+            self._poll_j4_if_needed()
 
             if not self._target_alive():
                 self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
@@ -445,11 +560,24 @@ class TcpFollowNode(Node):
             vy = self._clamp(vy, -self._params.vmax_y_mm_s, self._params.vmax_y_mm_s)
             vz = self._clamp(vz, -self._params.vmax_z_mm_s, self._params.vmax_z_mm_s)
 
-            # ✅ base Y/Z 절대 리미트 적용
+            # NEWWWWWWWWWW
+            vy = self._apply_vmin(vy, self._vmin_y_mm_s)
+            vz = self._apply_vmin(vz, self._vmin_z_mm_s)
+
+            wy = 0.0
+            if self._enable_b_rotation:
+                wy = self._b_sign * (self._wb_deg_s_per_error * fx)
+                wy = self._clamp(wy, -self._wmax_b_deg_s, self._wmax_b_deg_s)
+
+            # base Y/Z 절대 리미트 적용
             vy, vz = self._apply_base_yz_limits(vy, vz)
 
-            self._robot.speedl((0.0, vy, vz, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
+            # J4 리미트 적용 (걸리면 vy/vz/wy 모두 0으로 컷)
+            vy, vz, wy = self._apply_j4_limit_hold(vy, vz, wy)
+
+            self._robot.speedl((0.0, vy, vz, 0.0, wy, 0.0), acc=self._speedl_acc, time_s=cmd_time)
             time.sleep(dt)
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
@@ -463,6 +591,7 @@ def main(args=None) -> None:
         dr = initialize_robot(follow_node)
         follow_node.set_dr(dr)
 
+        # startup movej는 executor.spin() 전에만 1회 호출
         if bool(follow_node.get_parameter("startup_movej_enable").value):
             joints = list(follow_node.get_parameter("startup_movej_joints_deg").value)
             vel = float(follow_node.get_parameter("startup_movej_vel").value)

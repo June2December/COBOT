@@ -115,7 +115,7 @@ class YoloCameraNode(Node):
         # -------------------------------
         # Parameters
         # -------------------------------
-        self.declare_parameter("image_topic", "/camera/color/image_raw")
+        self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("model", "Day.pt")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("target_class_name", "person")

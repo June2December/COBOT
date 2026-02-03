@@ -131,9 +131,9 @@ class SaluteRunner(Node):
         vel = self.vel
         acc = self.acc
 
-        J_READY = [0, 0, 90, -90, 0, 0]
-        J_SALUTE1 = [-90, 90, 0, -90, 0, 90]
-        J_SALUTE2 = [-90, 90, -120, -90, 0, 90]
+        J_READY = [0, 0, -90, 90, 0, 0]
+        J_SALUTE1 = [-90, -80, 0, 90, 0, 90]
+        J_SALUTE2 = [-90, -90, 125, 90, 0, 90]
 
         self.get_logger().info("Robot: move to READY")
         if not self._call_movej(J_READY, vel=vel, acc=acc):
