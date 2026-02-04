@@ -8,7 +8,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient
 
 from std_msgs.msg import String, Bool
-from std_srvs.srv import Trigger
+import time
 
 # usrr defined interface / Authentication
 from cobot2_interfaces.action import Auth
@@ -44,6 +44,10 @@ class OrchestratorNode(Node):
         # trigger 기반 시작
         self.declare_parameter("trigger_topic", "/orchestrator/trigger")
 
+        # lock_done 기반 자동 시작
+        self.declare_parameter("lock_done_topic", "/follow/lock_done")
+        self.declare_parameter("lock_done_debounce_sec", 2.0)
+
         # 오늘의 암구호(문어/답어)는 여기서 주입받도록(launch에서 바꾸기 쉬움)
         self.declare_parameter("challenge_text", "아이폰")
         self.declare_parameter("expected_text", "갤럭시")
@@ -59,6 +63,10 @@ class OrchestratorNode(Node):
         self._challenge = self.get_parameter("challenge_text").value
         self._expected = self.get_parameter("expected_text").value
 
+        # lock_done 으로 암구호 시퀀스로 넘어가는 단계
+        self._lock_done_topic = self.get_parameter("lock_done_topic").value
+        self._lock_done_debounce_sec = float(self.get_parameter("lock_done_debounce_sec").value)
+        self._last_lock_done_start_t: float = 0.0
 
         self._salute_trigger_topic = self.get_parameter("salute_trigger_topic").value
         self._salute_done_topic = self.get_parameter("salute_done_topic").value
@@ -96,6 +104,10 @@ class OrchestratorNode(Node):
                                                 self._on_trigger,
                                                 10,
                                                 callback_group=self._cbg)
+        
+        # lock_done 자동 트리거 구독
+        self._sub_lock_done = self.create_subscription(
+            Bool, self._lock_done_topic, self._on_lock_done, 10, callback_group=self._cbg)
         
         self._pub_follow_enable = self.create_publisher(Bool, self._follow_enable_topic, 10)        
         # salute/shoot trigger publishers
@@ -156,9 +168,27 @@ class OrchestratorNode(Node):
 
         self._set_status("Start !!!")
         self.get_logger().info(f"challenge='{self._challenge}', expected='{self._expected}'")
-        self._set_follow_enable(False)
+        self._set_follow_enable(True)
         self._try_auth()
 
+    # ✅ NEW: lock_done 자동 시작
+    def _on_lock_done(self, msg: Bool):
+        # True일 때만 시작
+        if not msg.data:
+            return
+
+        # 중복 시작 방지
+        if self._busy:
+            return
+
+        # 디바운스 (락온 완료 True가 연속으로 들어오는 경우 대비)
+        now = time.time()
+        if (now - self._last_lock_done_start_t) < self._lock_done_debounce_sec:
+            return
+        self._last_lock_done_start_t = now
+
+        self._set_status("LOCK_DONE -> start AUTH")
+        self._start_sequence()
 
     def _on_trigger(self, msg: Bool):
         # True일 때만 시작
@@ -199,14 +229,17 @@ class OrchestratorNode(Node):
     def _on_salute_accord_text(self, msg: String):
         text = (msg.data or "").strip()
         self._last_salute_accord_text = text
+        out = String()
+        out.data = text
         self._pub_salute_accord_text.publish(String(data=text))
     # 들은 정보
     def _on_salute_heard_text(self, msg: String):
         text = (msg.data or "").strip()
         self._last_salute_heard_text = text
+        out = String()
+        out.data = text
         self._pub_salute_heard_text.publish(String(data=text))
     # ==================================================================================
-
     def _try_auth(self):
         self._attempts += 1
         self._set_status(f"Authentication : {self._attempts} / {self._auth_attempts}")
@@ -257,6 +290,7 @@ class OrchestratorNode(Node):
         if result.success:
             self._set_status("Auth success -> SALUTE")
             self._state = "SALUTE_WAIT"
+            self._set_follow_enable(False)  # SALUTE, tracking 끄고 하기
             self._pub_salute_trigger.publish(Bool(data=True))
             return
 
@@ -265,6 +299,7 @@ class OrchestratorNode(Node):
         else:
             self._set_status("Auth failed 3 times -> SHOOT")
             self._state = "SHOOT_WAIT"
+            self._set_follow_enable(False)  # SHOOT, tracking 끄고 하기
             self._pub_shoot_trigger.publish(Bool(data=True))
             return
         
@@ -281,7 +316,6 @@ def main(args=None):
     node = OrchestratorNode()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
-
     try:
         executor.spin()
     except KeyboardInterrupt:
@@ -290,5 +324,4 @@ def main(args=None):
         executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
-
         
