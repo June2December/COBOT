@@ -1,8 +1,6 @@
-# virtual_follow_with_dsr_no_realsense.launch v0.610 2026-02-04
+# virtual_follow_with_dsr_no_realsense.launch v0.710 2026-02-04
 # [이번 버전에서 수정된 사항]
-# - (기능구현) follow_ui_node 추가: 왼쪽 annotated 영상(/follow/annotated_image), 오른쪽 이벤트 로그(/follow/ui_event)
-# - (기능구현) UI raw fallback 토픽을 launch 인자 image_topic으로 연동
-# - (유지) RealSense bringup 제외 / dsr_bringup2 후 tcp_follow_node -> yolo_camera_node 순서 실행 유지
+# - (기능구현) follow_logger_node를 launch에 추가 (yolo_camera_node 실행 이후 함께 실행)
 
 import os
 
@@ -91,6 +89,20 @@ def generate_launch_description():
         ],
     )
 
+    # (C-1) follow_logger_node: 추종 관련 로그 기록
+    follow_logger = Node(
+        package="cobot2",
+        executable="follow_logger_node",
+        name="follow_logger_node",
+        output="screen",
+        parameters=[
+            {
+                # 필요한 파라미터가 이미 정해져 있으면 여기만 맞춰주면 됨
+                # (최소 변경 원칙: 기본값으로도 동작하도록 비워둬도 OK)
+            }
+        ],
+    )
+
     # (D) UI 노드: annotated 영상 + 로그 이벤트 표시
     follow_ui = Node(
         package="cobot2",
@@ -107,7 +119,7 @@ def generate_launch_description():
         ],
     )
 
-    # bringup -> tcp_follow -> yolo -> ui
+    # bringup -> tcp_follow -> yolo -> (logger + ui)
     delayed_chain = TimerAction(
         period=LaunchConfiguration("bringup_delay_sec"),
         actions=[
@@ -116,6 +128,8 @@ def generate_launch_description():
                 period=LaunchConfiguration("follow_to_yolo_delay_sec"),
                 actions=[
                     yolo_camera,
+                    # logger는 yolo 이후에 바로 같이 실행
+                    follow_logger,
                     # UI는 yolo와 동시에 떠도 되지만, 토픽 생성 타이밍 이슈 줄이려면 살짝 딜레이 주는 게 깔끔함
                     TimerAction(period=0.5, actions=[follow_ui]),
                 ],
