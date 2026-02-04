@@ -1,7 +1,8 @@
-# virtual_follow_with_dsr_no_realsense.launch v0.510 2026-01-29
+# virtual_follow_with_dsr_no_realsense.launch v0.610 2026-02-04
 # [이번 버전에서 수정된 사항]
-# - (기능구현) RealSense bringup 제외 (센서 드라이버는 별도 터미널에서 구동)
-# - (기능구현) dsr_bringup2 브링업 후 tcp_follow_node(초기 movej) -> yolo_camera_node 순서 실행
+# - (기능구현) follow_ui_node 추가: 왼쪽 annotated 영상(/follow/annotated_image), 오른쪽 이벤트 로그(/follow/ui_event)
+# - (기능구현) UI raw fallback 토픽을 launch 인자 image_topic으로 연동
+# - (유지) RealSense bringup 제외 / dsr_bringup2 후 tcp_follow_node -> yolo_camera_node 순서 실행 유지
 
 import os
 
@@ -25,10 +26,10 @@ def generate_launch_description():
     bringup_delay_arg = DeclareLaunchArgument("bringup_delay_sec", default_value="10.0")
     follow_to_yolo_delay_arg = DeclareLaunchArgument("follow_to_yolo_delay_sec", default_value="8.0")
 
-    # RealSense 토픽만 넘겨받아 YOLO가 구독 (RealSense는 외부에서 이미 실행 중이어야 함)
+    # RealSense 토픽만 넘겨받아 YOLO/UI가 구독 (RealSense는 외부에서 이미 실행 중이어야 함)
     image_topic_arg = DeclareLaunchArgument("image_topic", default_value="/camera/camera/color/image_raw")
 
-    # (A) Doosan emulator + RViz
+    # (A) Doosan bringup + RViz
     dsr_simulator = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(dsr_bringup2_dir, "launch", "dsr_bringup2_rviz.launch.py")
@@ -57,28 +58,18 @@ def generate_launch_description():
                 "startup_settle_sec": 7.0,
 
                 "error_topic": "/follow/error_norm",
-                "control_loop_hz": 15.0,
+                # "control_loop_hz": 15.0,
                 "target_lost_timeout_sec": 0.5,
 
-                "vel": 180.0,
-                "acc": 20.0,
+                # "vel": 180.0,
+                # "acc": 20.0,
 
                 "enable_translation": True,
                 "enable_rotation": False,
 
-                # "x_mm_per_error": 6.0,
-                # "y_mm_per_error": 6.0,
-                # "yaw_deg_per_error": 6.0,
-                # "pitch_deg_per_error": 6.0,
-
-                "max_delta_translation_mm": 5.0,
-                "max_delta_rotation_deg": 1.0,
-                "deadzone_error_norm": 0.03,
-
-                # "x_sign": 1.0,
-                # "y_sign": -1.0,
-                # "yaw_sign": 1.0,
-                # "pitch_sign": 1.0,
+                # "max_delta_translation_mm": 5.0,
+                # "max_delta_rotation_deg": 1.0,
+                # "deadzone_error_norm": 0.03,
             }
         ],
     )
@@ -91,22 +82,43 @@ def generate_launch_description():
         output="screen",
         parameters=[
             {
-                # "image_topic": LaunchConfiguration("image_topic"),
+                "image_topic": LaunchConfiguration("image_topic"),
                 "target_class_name": "person",
                 "min_confidence": 0.6,
                 "publish_topic": "/follow/error_norm",
-                "show_debug": True,
+                "show_debug": False,
             }
         ],
     )
 
+    # (D) UI 노드: annotated 영상 + 로그 이벤트 표시
+    follow_ui = Node(
+        package="cobot2",
+        executable="follow_ui_node",
+        name="follow_ui_node",
+        output="screen",
+        parameters=[
+            {
+                "annotated_image_topic": "/follow/annotated_image",
+                "ui_event_topic": "/follow/ui_event",
+                # annotated 끊기면 raw로 fallback (Day/Night 토픽은 launch 인자만 바꿔주면 됨)
+                "raw_image_topic": LaunchConfiguration("image_topic"),
+            }
+        ],
+    )
+
+    # bringup -> tcp_follow -> yolo -> ui
     delayed_chain = TimerAction(
         period=LaunchConfiguration("bringup_delay_sec"),
         actions=[
             tcp_follow,
             TimerAction(
                 period=LaunchConfiguration("follow_to_yolo_delay_sec"),
-                actions=[yolo_camera],
+                actions=[
+                    yolo_camera,
+                    # UI는 yolo와 동시에 떠도 되지만, 토픽 생성 타이밍 이슈 줄이려면 살짝 딜레이 주는 게 깔끔함
+                    TimerAction(period=0.5, actions=[follow_ui]),
+                ],
             ),
         ],
     )
