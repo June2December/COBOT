@@ -9,7 +9,7 @@ import os
 def generate_launch_description():
     # --- Doosan (real) bringup ---
     
-    REAL_SWITCH = False
+    REAL_SWITCH = True
 
     REAL = {"mode": "real",    "host": "192.168.1.100", "port": "12345", "model": "m0609"}
     VIRTUAL = {"mode": "virtual", "host": "127.0.0.1",     "port": "12345", "model": "m0609"}
@@ -68,7 +68,7 @@ def generate_launch_description():
         parameters=[{
             "error_topic": "/follow/error_norm",
             "enable_topic": "/follow/enable",
-            "follow_enable_default": False,
+            "follow_enable_default": True,
         }],
     )
 

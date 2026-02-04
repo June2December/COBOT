@@ -87,7 +87,7 @@ class ShootRunner(Node):
             # ✅ 먼저 TTS
             if self.tts_enabled and self.tts_text.strip():
                 speak(self.tts_text)
-            ok = self._salute_motion()
+            ok = self._shoot_motion()
 
         except Exception:
             self.get_logger().error("Shoot failed:\n" + traceback.format_exc())
@@ -129,26 +129,28 @@ class ShootRunner(Node):
             self.get_logger().error("move_joint returned success=False")
         return bool(resp.success)
 
-    def _salute_motion(self) -> bool:
+    def _shoot_motion(self) -> bool:
         vel = self.vel
         acc = self.acc
-
         J_READY = [0, 0, 90, -90, 0, 0]
-        J_SALUTE1 = [0, 0, 85, -90, 0, 0]
-
+        J_D = [0, 0, 95, -90, 0, 0]
+        J_SALUTE1 = [0, 0, 75, -90, 0, 0]
         self.get_logger().info("Robot: move to READY")
         if not self._call_movej(J_READY, vel=vel, acc=acc):
             return False
+        for i in range(3):
 
-        self.get_logger().info("Robot: SHOOT")
-        if not self._call_movej(J_SALUTE1, vel=100, acc=80): return False
+            self.get_logger().info(f"[{i+1}/3] Robot: SHOOT")
+            if not self._call_movej(J_SALUTE1, vel=500, acc=400): return False
 
-        self.get_logger().info("Robot: back to READY")
-        if not self._call_movej(J_READY, vel=100, acc=80):
+            self.get_logger().info("Robot: back to READY")
+            if not self._call_movej(J_D, vel=100, acc=150):
+                return False
+        
+        self.get_logger().info("Robot: move to READY")
+        if not self._call_movej(J_READY, vel=vel, acc=acc):
             return False
-
         return True
-
 
 def main():
     rclpy.init()

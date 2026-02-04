@@ -1,13 +1,3 @@
-"""
-1. 암구호 시퀀스 최대 3회 호출
-        # Goal challenge(문어), expected(답어)
-        ---
-        # Result success(성공여부), heard_text(거수자의 대답), reason(성공 여부 판명 근거), code(세부 판명 code)
-        ---
-        # Feedback mode(현재 시퀀스에서 어느 단계인지)
-    - success=True : 경례
-    - success=Falsae : 더미 동작
-"""
 # use for annotations(hint) for debug error
 from __future__ import annotations
 
@@ -37,7 +27,16 @@ class OrchestratorNode(Node):
         self.declare_parameter("shoot_trigger_topic", "/shoot_trigger")
         self.declare_parameter("shoot_done_topic", "/shoot_done")
         self.declare_parameter("follow_enable_topic", "/follow/enable")
-        
+
+        # (추가1) salute_node의 stt sub/pub param ============================================
+        # 암구호 일치
+        self.declare_parameter("salute_accord_topic", "/salute_accord_topic")
+        self.declare_parameter("salute_accord_out_topic", "/orchestrator/salute_accord_topic")
+        # 들은 정보 ex) '중위 김준혁'
+        self.declare_parameter("salute_heard_topic", "/salute_heard_text")
+        self.declare_parameter("salute_heard_out_topic", "/orchestrator/salute_heard_text")
+        # ==================================================================================
+
         # for node
         self.declare_parameter("auth_action_name", "/auth_action")
         self.declare_parameter("auth_attempts", 3)
@@ -66,6 +65,17 @@ class OrchestratorNode(Node):
         self._shoot_trigger_topic = self.get_parameter("shoot_trigger_topic").value
         self._shoot_done_topic = self.get_parameter("shoot_done_topic").value
         self._follow_enable_topic = self.get_parameter("follow_enable_topic").value
+        
+        # (추가2) salute_node stt sub/pub self =============================================
+        # 암구호 일치
+        self._salute_accord_topic = self.get_parameter("salute_accord_topic").value
+        self._salute_accord_out_topic = self.get_parameter("salute_accord_out_topic").value
+        self._last_salute_accord_text = ""
+        # 들은 정보
+        self._salute_heard_topic = self.get_parameter("salute_heard_topic").value
+        self._salute_heard_out_topic = self.get_parameter("salute_heard_out_topic").value
+        self._last_salute_heard_text = ""
+        # =================================================================================
 
         # state machine
         self._state = "IDLE"  # IDLE | AUTH | SALUTE_WAIT | SHOOT_WAIT
@@ -92,6 +102,13 @@ class OrchestratorNode(Node):
         self._pub_salute_trigger = self.create_publisher(Bool, self._salute_trigger_topic, 10)
         self._pub_shoot_trigger = self.create_publisher(Bool, self._shoot_trigger_topic, 10)
 
+        # (추가3) salute_node stt republish ============================================================
+        # 암구호 일치
+        self._pub_salute_accord_text = self.create_publisher(String, self._salute_accord_out_topic, 10)
+        # 들은 정보
+        self._pub_salute_heard_text = self.create_publisher(String, self._salute_heard_out_topic, 10)
+        # =============================================================================================
+        
         # salute/shoot done subscribers
         self._sub_salute_done = self.create_subscription(
             Bool, self._salute_done_topic, self._on_salute_done, 10, callback_group=self._cbg
@@ -100,6 +117,16 @@ class OrchestratorNode(Node):
             Bool, self._shoot_done_topic, self._on_shoot_done, 10, callback_group=self._cbg
         )
 
+        # (추가4) salute_node stt sub create ==============================================================
+        # 암구호 일치
+        self._sub_salute_accord_text = self.create_subscription(
+            String, self._salute_accord_topic, self._on_salute_accord_text, 10, callback_group=self._cbg
+        )
+        # 들은 정보
+        self._sub_salute_heard_text = self.create_subscription(
+            String, self._salute_heard_topic, self._on_salute_heard_text, 10, callback_group=self._cbg
+        )
+        # ================================================================================================
         self._auth = ActionClient(self, Auth, self._auth_action_name, callback_group=self._cbg)
         self._set_status("Ready")
 
@@ -166,6 +193,19 @@ class OrchestratorNode(Node):
         self._set_follow_enable(True)
         self._state = "IDLE"
         self._busy = False
+    
+    # (추가5) salute_node stt def ======================================================
+    # 암구호 일치
+    def _on_salute_accord_text(self, msg: String):
+        text = (msg.data or "").strip()
+        self._last_salute_accord_text = text
+        self._pub_salute_accord_text.publish(String(data=text))
+    # 들은 정보
+    def _on_salute_heard_text(self, msg: String):
+        text = (msg.data or "").strip()
+        self._last_salute_heard_text = text
+        self._pub_salute_heard_text.publish(String(data=text))
+    # ==================================================================================
 
     def _try_auth(self):
         self._attempts += 1
