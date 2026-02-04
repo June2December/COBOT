@@ -8,12 +8,12 @@ import os
 
 def generate_launch_description():
     # --- Doosan (real) bringup ---
-    
     REAL_SWITCH = True
 
-    REAL = {"mode": "real",    "host": "192.168.1.100", "port": "12345", "model": "m0609"}
-    VIRTUAL = {"mode": "virtual", "host": "127.0.0.1",     "port": "12345", "model": "m0609"}
+    REAL = {"mode": "real", "host": "192.168.1.100", "port": "12345", "model": "m0609"}
+    VIRTUAL = {"mode": "virtual", "host": "127.0.0.1", "port": "12345", "model": "m0609"}
     launch_args = (REAL if REAL_SWITCH else VIRTUAL)
+
     dsr_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
@@ -25,10 +25,10 @@ def generate_launch_description():
         launch_arguments=launch_args.items(),
     )
 
-    # --- Perception (optional, no hard dependency for motion) ---
+    # --- Perception (YOLO) ---
     yolo_camera_node = Node(
         package="cobot2",
-        executable="yolo_camera",
+        executable="yolo_camera",          # ✅ FIX
         name="yolo_camera_node",
         output="screen",
         parameters=[{
@@ -37,32 +37,33 @@ def generate_launch_description():
         }],
     )
 
-    # --- Authentication Action Server (must be ready before orchestrator sends goal) ---
+    # --- Authentication Action Server ---
     auth_action_server = Node(
         package="cobot2",
-        executable="auth_action",
+        executable="auth_action",          # ✅ FIX
         name="auth_action_server",
         output="screen",
     )
 
-    # --- Motion nodes (must be ready before orchestrator publishes triggers) ---
+    # --- Motion nodes ---
     salute_node = Node(
         package="cobot2",
-        executable="salute",
+        executable="salute",               # ✅ FIX
         name="salute_node",
         output="screen",
     )
+
     shoot_node = Node(
         package="cobot2",
-        executable="shoot",
+        executable="shoot",                # ✅ FIX
         name="shoot_node",
         output="screen",
     )
 
-    # --- Follow control (start disabled; enable only when orchestrator allows) ---
+    # --- Follow control ---
     tcp_follow_node = Node(
         package="cobot2",
-        executable="tcp_follow",
+        executable="tcp_follow",           # ✅ FIX
         name="tcp_follow_node",
         output="screen",
         parameters=[{
@@ -72,31 +73,19 @@ def generate_launch_description():
         }],
     )
 
-    # --- Orchestrator (start last) ---
+    # --- Orchestrator ---
     orchestrator_node = Node(
         package="cobot2",
-        executable="orchestrator",
+        executable="orchestrator",         # ✅ OK
         name="orchestrator_node",
         output="screen",
     )
 
-    # ========= Launch ordering (time-based gating) =========
-    # 0s  : dsr bringup
-    # 1.5s: auth + motion nodes (they may wait for dsr services internally)
-    # 3.0s: follow node (disabled)
-    # 4.0s: orchestrator (now safe to trigger)
     return LaunchDescription([
         dsr_launch,
 
-        # perception can start anytime; keep it early
-        TimerAction(period=10., actions=[yolo_camera_node]),
-
-        # servers/consumers before orchestrator
-        TimerAction(period=13., actions=[auth_action_server, salute_node, shoot_node]),
-
-        # follow after motion nodes, still disabled
-        TimerAction(period=16., actions=[tcp_follow_node]),
-
-        # orchestrator last
-        TimerAction(period=20., actions=[orchestrator_node]),
+        TimerAction(period=10.0, actions=[yolo_camera_node]),
+        TimerAction(period=13.0, actions=[auth_action_server, salute_node, shoot_node]),
+        TimerAction(period=16.0, actions=[tcp_follow_node]),
+        TimerAction(period=20.0, actions=[orchestrator_node]),
     ])

@@ -1,5 +1,13 @@
+# orchestrator v0.501 2026-02-04
+# [이번 버전에서 수정된 사항]
+# - (기능구현) /follow/lock_done(Bool) 구독 추가: lock_done=True 수신 시 인증 시퀀스 자동 시작
+# - (기능구현) lock_done 디바운스(중복 시작 방지) 추가: lock_done_debounce_sec
+# - (유지) 기존 /orchestrator/trigger 및 /orchestrator/start 기반 수동 시작 유지
+
 # use for annotations(hint) for debug error
 from __future__ import annotations
+
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -8,19 +16,20 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient
 
 from std_msgs.msg import String, Bool
-from std_srvs.srv import Trigger
 
 # usrr defined interface / Authentication
 from cobot2_interfaces.action import Auth
+
 
 class OrchestratorNode(Node):
     def __init__(self):
         super().__init__("orchestrator_node")
         self._cbg = ReentrantCallbackGroup()
-        
+
         # start, status : for test
-        self.declare_parameter("start_topic", "/orchestrator/start") 
-        self.declare_parameter("status_topic", "/orchestrator/status") # orche 상태 출력용
+        self.declare_parameter("start_topic", "/orchestrator/start")
+        self.declare_parameter("status_topic", "/orchestrator/status")  # orche 상태 출력용
+
         # for motion nodes (topic trigger)
         self.declare_parameter("salute_trigger_topic", "/salute_trigger")
         self.declare_parameter("salute_done_topic", "/salute_done")
@@ -44,6 +53,10 @@ class OrchestratorNode(Node):
         # trigger 기반 시작
         self.declare_parameter("trigger_topic", "/orchestrator/trigger")
 
+        # ✅ NEW: lock_done 기반 자동 시작
+        self.declare_parameter("lock_done_topic", "/follow/lock_done")
+        self.declare_parameter("lock_done_debounce_sec", 2.0)
+
         # 오늘의 암구호(문어/답어)는 여기서 주입받도록(launch에서 바꾸기 쉬움)
         self.declare_parameter("challenge_text", "아이폰")
         self.declare_parameter("expected_text", "갤럭시")
@@ -59,13 +72,17 @@ class OrchestratorNode(Node):
         self._challenge = self.get_parameter("challenge_text").value
         self._expected = self.get_parameter("expected_text").value
 
+        # ✅ NEW
+        self._lock_done_topic = self.get_parameter("lock_done_topic").value
+        self._lock_done_debounce_sec = float(self.get_parameter("lock_done_debounce_sec").value)
+        self._last_lock_done_start_t: float = 0.0
 
         self._salute_trigger_topic = self.get_parameter("salute_trigger_topic").value
         self._salute_done_topic = self.get_parameter("salute_done_topic").value
         self._shoot_trigger_topic = self.get_parameter("shoot_trigger_topic").value
         self._shoot_done_topic = self.get_parameter("shoot_done_topic").value
         self._follow_enable_topic = self.get_parameter("follow_enable_topic").value
-        
+
         # (추가2) salute_node stt sub/pub self =============================================
         # 암구호 일치
         self._salute_accord_topic = self.get_parameter("salute_accord_topic").value
@@ -80,24 +97,24 @@ class OrchestratorNode(Node):
         # state machine
         self._state = "IDLE"  # IDLE | AUTH | SALUTE_WAIT | SHOOT_WAIT
 
-
         self._busy = False
         self._attempts = 0
 
-        self._pub_status = self.create_publisher(String, self._status_topic, 10) # orche 상태 출력용
-        self._sub_start = self.create_subscription(String,
-                                                   self._start_topic,
-                                                   self._on_start,
-                                                   10,
-                                                   callback_group=self._cbg)
-        
-        self._sub_trigger = self.create_subscription(Bool,
-                                                self._trigger_topic,
-                                                self._on_trigger,
-                                                10,
-                                                callback_group=self._cbg)
-        
-        self._pub_follow_enable = self.create_publisher(Bool, self._follow_enable_topic, 10)        
+        self._pub_status = self.create_publisher(String, self._status_topic, 10)  # orche 상태 출력용
+        self._sub_start = self.create_subscription(
+            String, self._start_topic, self._on_start, 10, callback_group=self._cbg
+        )
+
+        self._sub_trigger = self.create_subscription(
+            Bool, self._trigger_topic, self._on_trigger, 10, callback_group=self._cbg
+        )
+
+        # ✅ NEW: lock_done 자동 트리거 구독
+        self._sub_lock_done = self.create_subscription(
+            Bool, self._lock_done_topic, self._on_lock_done, 10, callback_group=self._cbg
+        )
+
+        self._pub_follow_enable = self.create_publisher(Bool, self._follow_enable_topic, 10)
         # salute/shoot trigger publishers
         self._pub_salute_trigger = self.create_publisher(Bool, self._salute_trigger_topic, 10)
         self._pub_shoot_trigger = self.create_publisher(Bool, self._shoot_trigger_topic, 10)
@@ -108,7 +125,7 @@ class OrchestratorNode(Node):
         # 들은 정보
         self._pub_salute_heard_text = self.create_publisher(String, self._salute_heard_out_topic, 10)
         # =============================================================================================
-        
+
         # salute/shoot done subscribers
         self._sub_salute_done = self.create_subscription(
             Bool, self._salute_done_topic, self._on_salute_done, 10, callback_group=self._cbg
@@ -127,12 +144,13 @@ class OrchestratorNode(Node):
             String, self._salute_heard_topic, self._on_salute_heard_text, 10, callback_group=self._cbg
         )
         # ================================================================================================
+
         self._auth = ActionClient(self, Auth, self._auth_action_name, callback_group=self._cbg)
         self._set_status("Ready")
 
     # helper functions
     #########################################################
-    def _on_start(self, msg:String):
+    def _on_start(self, msg: String):
         if self._busy:
             self._set_status("Busy, ignoring start")
             return
@@ -159,6 +177,24 @@ class OrchestratorNode(Node):
         self._set_follow_enable(False)
         self._try_auth()
 
+    # ✅ NEW: lock_done 자동 시작
+    def _on_lock_done(self, msg: Bool):
+        # True일 때만 시작
+        if not msg.data:
+            return
+
+        # 중복 시작 방지
+        if self._busy:
+            return
+
+        # 디바운스 (락온 완료 True가 연속으로 들어오는 경우 대비)
+        now = time.time()
+        if (now - self._last_lock_done_start_t) < self._lock_done_debounce_sec:
+            return
+        self._last_lock_done_start_t = now
+
+        self._set_status("LOCK_DONE -> start AUTH")
+        self._start_sequence()
 
     def _on_trigger(self, msg: Bool):
         # True일 때만 시작
@@ -171,7 +207,6 @@ class OrchestratorNode(Node):
             return
 
         self._start_sequence()
-
 
     def _set_status(self, txt):
         msg = String()
@@ -193,18 +228,20 @@ class OrchestratorNode(Node):
         self._set_follow_enable(True)
         self._state = "IDLE"
         self._busy = False
-    
+
     # (추가5) salute_node stt def ======================================================
     # 암구호 일치
     def _on_salute_accord_text(self, msg: String):
         text = (msg.data or "").strip()
         self._last_salute_accord_text = text
         self._pub_salute_accord_text.publish(String(data=text))
+
     # 들은 정보
     def _on_salute_heard_text(self, msg: String):
         text = (msg.data or "").strip()
         self._last_salute_heard_text = text
         self._pub_salute_heard_text.publish(String(data=text))
+
     # ==================================================================================
 
     def _try_auth(self):
@@ -224,7 +261,7 @@ class OrchestratorNode(Node):
             self._busy = False
             self._state = "IDLE"
             return
-        
+
         goal = Auth.Goal()
         goal.challenge = self._challenge
         goal.expected = self._expected
@@ -248,10 +285,10 @@ class OrchestratorNode(Node):
     def _auth_result(self, future):
         result = future.result().result
         self.get_logger().info(
-            f"auth result: success={result.success} \
-                heard='{result.heard_text}' \
-                    code={result.code} \
-                        reason='{result.reason}'"
+            f"auth result: success={result.success} "
+            f"heard='{result.heard_text}' "
+            f"code={result.code} "
+            f"reason='{result.reason}'"
         )
 
         if result.success:
@@ -267,11 +304,11 @@ class OrchestratorNode(Node):
             self._state = "SHOOT_WAIT"
             self._pub_shoot_trigger.publish(Bool(data=True))
             return
-        
+
     def _auth_feedback(self, fb_msg):
         fb = fb_msg.feedback
         self._set_status(f"Auth mode: {fb.mode}")
-    
+
     def _set_follow_enable(self, enabled: bool) -> None:
         self._pub_follow_enable.publish(Bool(data=bool(enabled)))
 
@@ -291,4 +328,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-        
+
+if __name__ == "__main__":
+    main()
