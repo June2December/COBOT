@@ -248,10 +248,11 @@ class SaluteRunner(Node):
         req.mode = 0  # 기본 모드
 
         # 필드가 있을 때만 세팅 (환경별 msg 생성 차이 대비)
-        if hasattr(req, "blendType"):
-            req.blendType = 0
-        if hasattr(req, "syncType"):
-            req.syncType = 0
+        if hasattr(req, "blend_type"):
+            req.blend_type = 0
+        if hasattr(req, "sync_type"):
+            req.sync_type = 0
+        self.get_logger().info(f"MoveJoint fields: {req.__slots__}")
 
         future = self._cli_move_joint.call_async(req)
 

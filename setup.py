@@ -31,6 +31,8 @@ setup(
             "salute = cobot2.salute_node:main",
             "shoot = cobot2.shoot_node:main",
             "orchestrator = cobot2.orchestrator:main",
+            'follow_ui_node = cobot2.follow_ui_node:main',
+            'follow_logger_node = cobot2.follow_logger_node:main',
         ],
     },
 )

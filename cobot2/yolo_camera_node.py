@@ -1,8 +1,24 @@
-# yolo_camera_node v0.500 2026-02-04
+# yolo_camera_node v0.600 2026-02-05
 # [이번 버전에서 수정된 사항]
-# - (기능구현) UI용 annotated 영상 토픽 publish 추가: /follow/annotated_image (박스/마스크/aim 시각화 포함)
-# - (기능구현) UI용 이벤트 토픽 publish 추가: /follow/ui_event (탐지/락온/락온해제/락온완료 등 상태변화만)
-# - (유지) 기존 debug(imshow) 옵션 유지(원하면 show_debug:=false로 비활성 권장), error_norm/lock_done 로직 유지
+# - (기능구현) /follow/enable(Bool) 구독 추가: enable=False면 YOLO 추론/락온/error_norm/lock_done 발행을 중지(충돌 방지)
+# - (기능구현) enable=False 전환 시 lock 상태 리셋 + lock_done(False) 1회 publish(TRANSIENT_LOCAL 라치값 클리어 목적)
+# - (유지) UI 토픽(annotated/ui_event) 퍼블리시 및 기존 마스크 기반 aim/EMA/락온/lock_done 게이트 로직 유지
+
+"""
+YOLO 기반 객체 탐지 + 락온 + error_norm 퍼블리시 노드 (eye-in-hand tracking)
+
+주요 토픽
+- Sub:  image_topic (RGB/IR)
+- Pub:  /follow/error_norm (Float32MultiArray [ex, ey])
+- Pub:  /follow/lock_done (Bool, TRANSIENT_LOCAL; late-joiner safe)
+- Pub:  /follow/annotated_image (Image, 옵션)
+- Pub:  /follow/ui_event (String)
+
+추가(v0.600)
+- Sub: /follow/enable (Bool)
+  - False면 추론/락온/lock_done/error_norm(입력)을 사실상 차단하여
+    follow OFF 상태에서 salute/shoot 등의 동작과 충돌하지 않도록 한다.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +33,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray, String
 from ultralytics import YOLO
@@ -123,10 +140,10 @@ class YoloCameraNode(Node):
         self._bridge = CvBridge()
 
         # -------------------------------
-        # Parameters (기본)
+        # Parameters
         # -------------------------------
         self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
-        self.declare_parameter("model", "day.pt")
+        self.declare_parameter("model", "night.pt")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("target_class_name", "person")
 
@@ -135,7 +152,7 @@ class YoloCameraNode(Node):
         self.declare_parameter("maintain_conf_low", 0.4)
         self.declare_parameter("lost_timeout_sec", 0.6)
 
-        # ✅ LOCK_DONE error threshold (NEW)
+        # lock_done error threshold
         self.declare_parameter("lock_done_error_thresh", 0.15)
 
         # tracker
@@ -145,7 +162,8 @@ class YoloCameraNode(Node):
 
         # 출력
         self.declare_parameter("publish_topic", "/follow/error_norm")
-        self.declare_parameter("show_debug", True)
+        self.declare_parameter("show_debug", False)
+
         # UI / Debug output topics
         self.declare_parameter("publish_annotated", True)
         self.declare_parameter("annotated_topic", "/follow/annotated_image")
@@ -155,40 +173,37 @@ class YoloCameraNode(Node):
         self.declare_parameter("input_flip_v", True)
         self.declare_parameter("input_flip_h", False)
 
-        # 락온 완료 더미 토픽 (1회)
+        # 락온 완료 토픽
         self.declare_parameter("lock_done_topic", "/follow/lock_done")
         self.declare_parameter("lock_done_delay_sec", 1.0)
-
 
         # 시간 기반 토픽 전환
         self.declare_parameter("enable_time_based_switch", True)
         self.declare_parameter("day_image_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("night_image_topic", "/camera/camera/infra1/image_rect_raw")
         self.declare_parameter("day_start_hms", [7, 30, 0])
-        self.declare_parameter("night_start_hms", [17, 46, 0])
+        self.declare_parameter("night_start_hms", [13, 41, 0])
         self.declare_parameter("time_check_period_sec", 1.0)
 
         # 외부 override 토픽
         self.declare_parameter("image_topic_override_topic", "/follow/image_topic_override")
 
-        # -------------------------------
         # Mask centroid mode
-        # -------------------------------
         self.declare_parameter("use_mask_centroid", True)
         self.declare_parameter("mask_aim_up_ratio", 0.10)
         self.declare_parameter("mask_draw_contour", True)
 
-        # -------------------------------
-        # (NEW) Aim EMA filter
-        # -------------------------------
+        # Aim EMA filter
         self.declare_parameter("aim_ema_enable", True)
         self.declare_parameter("aim_ema_alpha", 0.25)  # 0.15~0.35 추천
 
-        # -------------------------------
-        # (NEW) Debug draw controls
-        # -------------------------------
-        self.declare_parameter("debug_draw_bbox", False)   # ✅ 기본: bbox 숨김
-        self.declare_parameter("debug_draw_mask", True)    # ✅ 기본: 마스크(윤곽) 표시
+        # Debug draw controls
+        self.declare_parameter("debug_draw_bbox", False)  # 기본: bbox 숨김
+        self.declare_parameter("debug_draw_mask", True)   # 기본: 마스크(윤곽) 표시
+
+        # (NEW) Follow enable gate
+        self.declare_parameter("follow_enable_topic", "/follow/enable")
+        self.declare_parameter("follow_enable_default", True)
 
         # -------------------------------
         # Read params
@@ -201,11 +216,7 @@ class YoloCameraNode(Node):
         self._lock_conf_high: float = float(self.get_parameter("lock_conf_high").value)
         self._maintain_conf_low: float = float(self.get_parameter("maintain_conf_low").value)
         self._lost_timeout_sec: float = float(self.get_parameter("lost_timeout_sec").value)
-
-        # ✅ NEW
-        self._lock_done_err_th: float = float(
-            self.get_parameter("lock_done_error_thresh").value
-        )
+        self._lock_done_err_th: float = float(self.get_parameter("lock_done_error_thresh").value)
 
         self._use_tracker: bool = bool(self.get_parameter("use_tracker").value)
         self._tracker_yaml: str = str(self.get_parameter("tracker_yaml").value)
@@ -216,7 +227,6 @@ class YoloCameraNode(Node):
         self._publish_annotated: bool = bool(self.get_parameter("publish_annotated").value)
         self._annotated_topic: str = str(self.get_parameter("annotated_topic").value)
         self._ui_event_topic: str = str(self.get_parameter("ui_event_topic").value)
-
 
         self._input_flip_v: bool = bool(self.get_parameter("input_flip_v").value)
         self._input_flip_h: bool = bool(self.get_parameter("input_flip_h").value)
@@ -243,6 +253,9 @@ class YoloCameraNode(Node):
         self._debug_draw_bbox: bool = bool(self.get_parameter("debug_draw_bbox").value)
         self._debug_draw_mask: bool = bool(self.get_parameter("debug_draw_mask").value)
 
+        self._follow_enable_topic: str = str(self.get_parameter("follow_enable_topic").value)
+        self._follow_enable: bool = bool(self.get_parameter("follow_enable_default").value)
+
         # -------------------------------
         # YOLO model (path resolve)
         # -------------------------------
@@ -256,8 +269,9 @@ class YoloCameraNode(Node):
                 self.get_logger().error(f"  - {p}")
             raise FileNotFoundError(f"model file not found: {self._model_path_raw}")
 
-        # [추가] 모폴로지 연산용 커널 (노이즈 제거용 5x5)
+        # 모폴로지 연산용 커널 (노이즈 제거용 5x5)
         self._morph_kernel = np.ones((5, 5), np.uint8)
+
         self.get_logger().info(f"[YOLO_CAMERA] loading model: {self._model_path}")
         self._yolo = YOLO(self._model_path)
 
@@ -270,17 +284,33 @@ class YoloCameraNode(Node):
         # ROS pubs/subs
         # -------------------------------
         self._pub_err = self.create_publisher(Float32MultiArray, self._publish_topic, 10)
-        self._pub_lock_done = self.create_publisher(Bool, self._lock_done_topic, 10)
+
+        # lock_done latched-like QoS (late-joiner safe)
+        self._qos_lock_done = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._pub_lock_done = self.create_publisher(Bool, self._lock_done_topic, self._qos_lock_done)
+
         # UI outputs
-        self._pub_annotated = self.create_publisher(Image, self._annotated_topic, 10) if self._publish_annotated else None
+        self._pub_annotated = (
+            self.create_publisher(Image, self._annotated_topic, 10) if self._publish_annotated else None
+        )
         self._pub_ui_event = self.create_publisher(String, self._ui_event_topic, 10)
         self._ui_prev_has_target: bool = False
         self._ui_prev_locked_id: Optional[int] = None
 
+        # follow enable gate subscriber
+        self.create_subscription(Bool, self._follow_enable_topic, self._on_follow_enable, 10)
+
+        # image subscription
         self._sub_image = None
         self._switch_image_topic(self._image_topic, reason="init")
         self.create_subscription(String, self._override_topic, self._on_override_topic, 10)
 
+        # time-based switching
         self._is_day: Optional[bool] = None
         if self._enable_time_switch:
             self._timer = self.create_timer(self._time_check_period, self._on_time_check)
@@ -291,7 +321,7 @@ class YoloCameraNode(Node):
         self._lock_acquired_t: float = 0.0
         self._lock_done_published: bool = False
 
-        # ✅ Last error for lock-done gating (NEW)
+        # Last error for lock-done gating
         self._last_ex: Optional[float] = None
         self._last_ey: Optional[float] = None
 
@@ -312,8 +342,44 @@ class YoloCameraNode(Node):
             f"[YOLO_CAMERA] ready (sub={self._image_topic}, model={self._model_path_raw} -> {self._model_path}, "
             f"target={self._target_class}, lock>={self._lock_conf_high}, keep>={self._maintain_conf_low}, "
             f"use_mask_centroid={self._use_mask_centroid}, aim_ema={self._aim_ema_enable} alpha={self._aim_ema_alpha:.2f}, "
-            f"draw_bbox={self._debug_draw_bbox}, draw_mask={self._debug_draw_mask})"
+            f"draw_bbox={self._debug_draw_bbox}, draw_mask={self._debug_draw_mask}, "
+            f"follow_enable_default={self._follow_enable})"
         )
+
+    # -------------------------------
+    # Follow enable gate
+    # -------------------------------
+    def _on_follow_enable(self, msg: Bool) -> None:
+        enabled = bool(msg.data)
+        if enabled == self._follow_enable:
+            return
+
+        self._follow_enable = enabled
+
+        if not enabled:
+            # 팔로우 OFF: 락/에러 상태 리셋
+            self._reset_lock_state()
+
+            # TRANSIENT_LOCAL 잔류 True 제거용으로 False 1회 publish
+            try:
+                self._pub_lock_done.publish(Bool(data=False))
+            except Exception:
+                pass
+
+            # UI 상태 캐시도 강제로 "없음"으로 맞춰서 이벤트 스팸 방지
+            self._ui_prev_has_target = False
+            self._ui_prev_locked_id = None
+
+            self._publish_ui_event("팔로우 비활성")
+            self.get_logger().warn("[YOLO_CAMERA] follow_enable -> False (inference gated)")
+        else:
+            # 팔로우 ON: 찌꺼기 방지용 리셋 후 재개
+            self._reset_lock_state()
+            self._ui_prev_has_target = False
+            self._ui_prev_locked_id = None
+
+            self._publish_ui_event("팔로우 활성")
+            self.get_logger().warn("[YOLO_CAMERA] follow_enable -> True (inference resumed)")
 
     # -------------------------------
     # Topic switching
@@ -328,6 +394,8 @@ class YoloCameraNode(Node):
         self._dbg_last_mode = "-"
         self._aim_ema_x = None
         self._aim_ema_y = None
+        self._last_ex = None
+        self._last_ey = None
 
     def _switch_image_topic(self, new_topic: str, *, reason: str) -> None:
         new_topic = str(new_topic).strip()
@@ -384,7 +452,6 @@ class YoloCameraNode(Node):
         msg.data = [float(ex), float(ey)]
         self._pub_err.publish(msg)
 
-
     def _publish_annotated_image(self, bgr: np.ndarray) -> None:
         if self._pub_annotated is None:
             return
@@ -414,7 +481,6 @@ class YoloCameraNode(Node):
             self._publish_ui_event("락온 해제")
         self._ui_prev_locked_id = self._locked_id
 
-
     def _maybe_publish_lock_done(self) -> None:
         if self._lock_done_published:
             return
@@ -423,7 +489,6 @@ class YoloCameraNode(Node):
         if self._last_ex is None or self._last_ey is None:
             return
 
-        # ✅ 추가 조건: 중심 근접
         if abs(self._last_ex) > self._lock_done_err_th:
             return
         if abs(self._last_ey) > self._lock_done_err_th:
@@ -462,33 +527,27 @@ class YoloCameraNode(Node):
             verbose=False,
             retina_masks=self._retina_masks,
         )
+
     def _refine_mask(self, mask_raw: np.ndarray, h: int, w: int) -> Optional[np.ndarray]:
         """
         [노이즈 제거] 마스크를 비트맵으로 그리고, 튀어나온 가시를 깎아낸 뒤(Open), 다시 윤곽선을 땀
         """
-        # 1. 캔버스에 그리기
         mask_img = np.zeros((h, w), dtype=np.uint8)
         pts = mask_raw.astype(np.int32)
         cv2.fillPoly(mask_img, [pts], 255)
 
-        # 2. 모폴로지 연산 (Opening: 깎아내기 -> 다시 불리기) -> 튀어나온 노이즈 제거
         mask_clean = cv2.morphologyEx(mask_img, cv2.MORPH_OPEN, self._morph_kernel)
 
-        # 3. 윤곽선 다시 추출
         contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
         if not contours:
             return None
-        
-        # 가장 큰 덩어리만 선택
+
         largest_contour = max(contours, key=cv2.contourArea)
-        
-        if cv2.contourArea(largest_contour) < 50: # 너무 작으면 무시
+        if cv2.contourArea(largest_contour) < 50:
             return None
-            
+
         return largest_contour.reshape(-1, 2)
 
-    # [수정됨] 인자에 h, w 추가됨
     def _extract_detections(self, result, h: int, w: int) -> List[Detection]:
         dets: List[Detection] = []
         boxes = getattr(result, "boxes", None)
@@ -516,7 +575,6 @@ class YoloCameraNode(Node):
                 try:
                     raw_mask = np.asarray(masks_xy[i], dtype=np.float32)
                     if len(raw_mask) > 0:
-                        # [핵심] 여기서 위에서 만든 _refine_mask를 호출해 노이즈를 제거함
                         contour_xy = self._refine_mask(raw_mask, h, w)
                 except Exception:
                     contour_xy = None
@@ -580,7 +638,6 @@ class YoloCameraNode(Node):
         return self._aim_ema_x, self._aim_ema_y
 
     def _compute_aim_point(self, target: Detection) -> Tuple[Tuple[float, float], str]:
-        # A) mask centroid
         if self._use_mask_centroid and target.contour_xy is not None and len(target.contour_xy) > 0:
             c = _centroid_from_contour(target.contour_xy)
             if c is not None:
@@ -594,7 +651,6 @@ class YoloCameraNode(Node):
                 self._dbg_last_aim_px = (aim_x, aim_y)
                 return (float(aim_x), float(aim_y)), "mask"
 
-        # B) bbox fallback
         bx, by = target.bbox_center_px
         self._dbg_last_centroid_px = None
         self._dbg_last_aim_px = (int(bx), int(by))
@@ -615,6 +671,33 @@ class YoloCameraNode(Node):
 
         h, w = frame_bgr.shape[:2]
 
+        # ✅ follow disabled: inference/lock/error input 차단
+        if not self._follow_enable:
+            self._last_ex = None
+            self._last_ey = None
+            self._publish_error(0.0, 0.0)
+
+            if self._pub_annotated is not None:
+                ann = frame_bgr.copy()
+                cv2.putText(
+                    ann,
+                    "FOLLOW DISABLED",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 0, 255),
+                    2,
+                )
+                self._publish_annotated_image(ann)
+
+            if self._show_debug:
+                cv2.imshow("yolo_camera_node", frame_bgr)
+                cv2.waitKey(1)
+            return
+
+        # -------------------------------
+        # normal mode
+        # -------------------------------
         results = self._run_inference(frame_bgr)
         result0 = results[0]
 
@@ -636,14 +719,13 @@ class YoloCameraNode(Node):
             self._dbg_last_mode = "-"
             self._aim_ema_x = None
             self._aim_ema_y = None
+            self._last_ex = None
+            self._last_ey = None
             self._publish_error(0.0, 0.0)
 
         self._maybe_publish_lock_done()
-
-        # UI event transitions (detection/lock)
         self._ui_update_transitions(target is not None)
 
-        # UI annotated stream (enabled)
         if self._pub_annotated is not None:
             ann = frame_bgr.copy()
             self._render_overlays(ann, target, w, h)
@@ -656,7 +738,6 @@ class YoloCameraNode(Node):
     # Debug draw
     # -------------------------------
     def _render_overlays(self, frame: np.ndarray, target: Optional[Detection], w: int, h: int) -> None:
-        """frame(BGR)에 디버그 오버레이를 그린다. (UI publish / imshow 공용)"""
         t = time.time()
         dt = max(1e-6, t - self._t_prev)
         self._t_prev = t
@@ -664,7 +745,9 @@ class YoloCameraNode(Node):
         self._fps_ema = 0.9 * self._fps_ema + 0.1 * fps if self._fps_ema > 0.0 else fps
 
         cv2.circle(frame, (w // 2, h // 2), 6, (0, 255, 255), -1)
-        cv2.putText(frame, f"FPS: {self._fps_ema:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.putText(
+            frame, f"FPS: {self._fps_ema:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2
+        )
 
         lock_txt = f"LOCK: {self._locked_id}" if self._locked_id is not None else "LOCK: -"
         cv2.putText(frame, lock_txt, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
@@ -708,7 +791,6 @@ class YoloCameraNode(Node):
         self._render_overlays(frame, target, w, h)
         cv2.imshow("yolo_camera_node", frame)
         cv2.waitKey(1)
-
 
 
 def main(args=None):
