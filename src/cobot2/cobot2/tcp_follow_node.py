@@ -322,8 +322,18 @@ class TcpFollowNode(Node):
     
     # add 2 helper functions / tcp follow switch
     def _on_enable(self, msg: Bool) -> None:
+        # 사실상 temp 처럼 임시
+        new_enabled = bool(msg.data)
         with self._en_lock:
-            self._enabled = bool(msg.data)
+            prev_enabled = self._enabled
+            self._enabled = new_enabled
+        
+        # falling edge로
+        if prev_enabled and (not new_enabled):
+            if self._startup_done:
+                dt = 1.0 / max(self._command_rate_hz, 1.0)
+                cmd_time = dt * max(self._speedl_time_scale, 1.0)
+                self._robot.speedl((0.,0.,0.,0.,0.,0.), acc=self._speedl_acc, time_s=cmd_time)
 
     def _is_enabled(self) -> bool:
         with self._en_lock:
@@ -546,13 +556,15 @@ class TcpFollowNode(Node):
 
         while rclpy.ok():
             if not self._startup_done:
-                self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
+                # 혹시 dsr 이랑 tcp_follow_node 에서 다시 move 치대한 안불러 보자
+                # self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
                 time.sleep(dt)
                 continue
             
             # orchestrator enable switch
             if not self._is_enabled():
-                self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
+                # 혹시 dsr 이랑 tcp_follow_node 에서 다시 move 치대한 안불러 보자
+                # self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
                 time.sleep(dt)
                 continue
 
@@ -560,13 +572,15 @@ class TcpFollowNode(Node):
             self._poll_j4_if_needed()
 
             if not self._target_alive():
-                self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
+                # 혹시 dsr 이랑 tcp_follow_node 에서 다시 move 치대한 안불러 보자
+                # self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
                 time.sleep(dt)
                 continue
 
             e = self._get_latest_error()
             if e is None:
-                self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
+                # 혹시 dsr 이랑 tcp_follow_node 에서 다시 move 치대한 안불러 보자 / 비상정지가 홈으로...
+                # self._robot.speedl((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), acc=self._speedl_acc, time_s=cmd_time)
                 time.sleep(dt)
                 continue
 
