@@ -19,6 +19,7 @@ from std_msgs.msg import String, Bool
 
 # usrr defined interface / Authentication
 from cobot2_interfaces.action import Auth
+from cobot2.speak import speak
 
 WEEKLY_PHRASES: dict[str, tuple[str, str]] = {
     "2026-02-05": ("iphone", "galaxy"),
@@ -68,6 +69,7 @@ class OrchestratorNode(Node):
         # 암구호 default
         self.declare_parameter("challenge_text", "아이폰")
         self.declare_parameter("expected_text", "갤럭시")
+        self.declare_parameter("saystop_text", "정지, 정지, 정지, 움직이면 쏜다!")
 
         # DB/로그용 단계 이벤트 토픽 (로거가 타임스탬프를 찍음)
         self.declare_parameter("ui_event_topic", "/follow/ui_event")
@@ -107,6 +109,7 @@ class OrchestratorNode(Node):
         # =================================================================================
         self._challenge_default = str(self.get_parameter("challenge_text").value)
         self._expected_default = str(self.get_parameter("expected_text").value)
+        self._saystop_text = str(self.get_parameter("saystop_text").value)
 
         self._ui_event_topic = self.get_parameter("ui_event_topic").value
 
@@ -222,6 +225,10 @@ class OrchestratorNode(Node):
 
     # helper functions
     #########################################################
+    # 수정3)
+    def _say(self, text: str):
+        if self._saystop_text and text and text.strip():
+            speak(text)
     def _on_start(self, msg:String):
         if self._busy:
             self._set_status("Busy, ignore start")
@@ -272,7 +279,7 @@ class OrchestratorNode(Node):
         if (now - self._last_lock_done_start_t) < self._lock_done_debounce_sec:
             return
         self._last_lock_done_start_t = now
-
+        self._say(self._saystop_text)
         self._set_status("LOCK_DONE -> start AUTH")
         self._emit_event("LOCK_DONE -> start AUTH")
         self._start_sequence()
