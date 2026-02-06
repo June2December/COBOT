@@ -33,9 +33,44 @@ def generate_launch_description():
         output="screen",
         parameters=[{
             "image_topic": "/camera/camera/color/image_raw",
-            "show_debug": True,
+            "show_debug": False,
+
+            # UI outputs
+            "publish_annotated": True,
+            "annotated_topic": "/follow/annotated_image",
+            "ui_event_topic": "/follow/ui_event",
+
+            # lock_done topic
+            "lock_done_topic": "/follow/lock_done",
         }],
     )
+
+    # --- DB Logger (SQLite + snapshots) ---
+    follow_logger_node = Node(
+        package="cobot2",
+        executable="follow_logger",
+        name="follow_logger_node",
+        output="screen",
+        parameters=[{
+            "ui_event_topic": "/follow/ui_event",
+            "annotated_image_topic": "/follow/annotated_image",
+            "log_root_dir": os.path.join(os.path.expanduser("~"), "logs", "follow_runs"),
+            "snapshot_enable": True,
+        }],
+    )
+
+    # --- UI (Live + History) ---
+    follow_ui_node = Node(
+        package="cobot2",
+        executable="follow_ui",
+        name="follow_ui_node",
+        output="screen",
+        parameters=[{
+            "annotated_image_topic": "/follow/annotated_image",
+            "ui_event_topic": "/follow/ui_event",
+        }],
+    )
+
 
     # --- Authentication Action Server (must be ready before orchestrator sends goal) ---
     auth_action_server = Node(
@@ -59,7 +94,7 @@ def generate_launch_description():
         output="screen",
     )
 
-    # --- Follow control (start disabled; enable only when orchestrator allows) ---
+    # --- Follow control ---
     tcp_follow_node = Node(
         package="cobot2",
         executable="tcp_follow",
@@ -76,8 +111,22 @@ def generate_launch_description():
     orchestrator_node = Node(
         package="cobot2",
         executable="orchestrator",
-        name="orchestrator_node",
+        name="orchestrator",
         output="screen",
+    )
+    # --- safety moitor (start last) ---
+    safety_monitor_node = Node(
+        package="cobot2",
+        executable="safety_monitor",
+        name="safety_monitor_node",
+        output="screen",
+        parameters=[{
+            "robot_id": "dsr01",
+            "robot_model": "m0609",
+            "event_topic": "/safety/event",
+            "poll_period_sec": 0.3,
+            "stop_on_fault": True,
+        }],
     )
 
     # ========= Launch ordering (time-based gating) =========
@@ -91,8 +140,14 @@ def generate_launch_description():
         # perception can start anytime; keep it early
         TimerAction(period=10., actions=[yolo_camera_node]),
 
+        # yolo 이후에 logger/ui 붙이기
+        TimerAction(period=12., actions=[follow_logger_node, follow_ui_node]),
+
         # servers/consumers before orchestrator
         TimerAction(period=13., actions=[auth_action_server, salute_node, shoot_node]),
+
+        # safety_monitor last
+        TimerAction(period=14., actions=[safety_monitor_node]),
 
         # follow after motion nodes, still disabled
         TimerAction(period=16., actions=[tcp_follow_node]),

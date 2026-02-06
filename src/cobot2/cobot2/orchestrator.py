@@ -72,6 +72,9 @@ class OrchestratorNode(Node):
         # DB/로그용 단계 이벤트 토픽 (로거가 타임스탬프를 찍음)
         self.declare_parameter("ui_event_topic", "/follow/ui_event")
         #########################################################
+        self.declare_parameter("safety_stop_topic", "/orchestrator/safety_stop")
+        self._safety_stop_topic = self.get_parameter("safety_stop_topic").value
+        #########################################################
         self._start_topic = self.get_parameter("start_topic").value
         self._status_topic = self.get_parameter("status_topic").value
         self._auth_action_name = self.get_parameter("auth_action_name").value
@@ -104,6 +107,8 @@ class OrchestratorNode(Node):
         # =================================================================================
         self._challenge_default = str(self.get_parameter("challenge_text").value)
         self._expected_default = str(self.get_parameter("expected_text").value)
+
+        self._ui_event_topic = self.get_parameter("ui_event_topic").value
 
         # 런타임 적용값(시작 시 딕셔너리로 갱신)
         self._challenge = self._challenge_default
@@ -169,6 +174,10 @@ class OrchestratorNode(Node):
         )
         # ================================================================================================
         self._auth = ActionClient(self, Auth, self._auth_action_name, callback_group=self._cbg)
+
+        # EMERGENCY
+        self._sub_safety_stop = self.create_subscription(Bool, self._safety_stop_topic, self._on_safety_stop, 10, callback_group=self._cbg)
+
         self._set_status("Ready...")
         self._emit_event("System initiate")
 
@@ -405,6 +414,29 @@ class OrchestratorNode(Node):
     
     def _set_follow_enable(self, enabled: bool) -> None:
         self._pub_follow_enable.publish(Bool(data=bool(enabled)))
+
+    # EMERGENCY
+    def _on_safety_stop(self, msg: Bool):
+        if not msg.data:
+            return
+
+        # 이미 IDLE이면 할 일 없음
+        if self._state == "IDLE" and not self._busy:
+            self._emit_event("SAFETY_STOP received (already idle)")
+            return
+
+        # 1) 상태 정리
+        self._emit_event("SAFETY_STOP received -> abort sequence")
+        self._set_status("SAFETY_STOP -> abort")
+
+        # 2) follow는 다시 켜서 추종/락온 흐름 복귀
+        self._set_follow_enable(True)
+        self._emit_event("tracking restart")
+
+        # 3) 오케스트레이터 상태를 즉시 IDLE로 복귀
+        self._state = "IDLE"
+        self._busy = False
+        self._attempts = 0
 
 
 def main(args=None):

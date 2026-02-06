@@ -17,6 +17,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray, String
 from ultralytics import YOLO
@@ -145,7 +146,7 @@ class YoloCameraNode(Node):
 
         # 출력
         self.declare_parameter("publish_topic", "/follow/error_norm")
-        self.declare_parameter("show_debug", True)
+        self.declare_parameter("show_debug", False)
         # UI / Debug output topics
         self.declare_parameter("publish_annotated", True)
         self.declare_parameter("annotated_topic", "/follow/annotated_image")
@@ -189,6 +190,10 @@ class YoloCameraNode(Node):
         # -------------------------------
         self.declare_parameter("debug_draw_bbox", False)   # ✅ 기본: bbox 숨김
         self.declare_parameter("debug_draw_mask", True)    # ✅ 기본: 마스크(윤곽) 표시
+
+        # (NEW) Follow enable gate
+        self.declare_parameter("follow_enable_topic", "/follow/enable")
+        self.declare_parameter("follow_enable_default", True)
 
         # -------------------------------
         # Read params
@@ -243,6 +248,9 @@ class YoloCameraNode(Node):
         self._debug_draw_bbox: bool = bool(self.get_parameter("debug_draw_bbox").value)
         self._debug_draw_mask: bool = bool(self.get_parameter("debug_draw_mask").value)
 
+        self._follow_enable_topic: str = str(self.get_parameter("follow_enable_topic").value)
+        self._follow_enable: bool = bool(self.get_parameter("follow_enable_default").value)
+
         # -------------------------------
         # YOLO model (path resolve)
         # -------------------------------
@@ -269,13 +277,24 @@ class YoloCameraNode(Node):
         # -------------------------------
         # ROS pubs/subs
         # -------------------------------
+
+        # lock_done latched-like QoS (late-joiner safe)
+        self._qos_lock_done = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self._pub_err = self.create_publisher(Float32MultiArray, self._publish_topic, 10)
-        self._pub_lock_done = self.create_publisher(Bool, self._lock_done_topic, 10)
+        self._pub_lock_done = self.create_publisher(Bool, self._lock_done_topic, self._qos_lock_done)
         # UI outputs
         self._pub_annotated = self.create_publisher(Image, self._annotated_topic, 10) if self._publish_annotated else None
         self._pub_ui_event = self.create_publisher(String, self._ui_event_topic, 10)
         self._ui_prev_has_target: bool = False
         self._ui_prev_locked_id: Optional[int] = None
+
+        # follow enable gate subscriber
+        self.create_subscription(Bool, self._follow_enable_topic, self._on_follow_enable, 10)
 
         self._sub_image = None
         self._switch_image_topic(self._image_topic, reason="init")
@@ -312,8 +331,44 @@ class YoloCameraNode(Node):
             f"[YOLO_CAMERA] ready (sub={self._image_topic}, model={self._model_path_raw} -> {self._model_path}, "
             f"target={self._target_class}, lock>={self._lock_conf_high}, keep>={self._maintain_conf_low}, "
             f"use_mask_centroid={self._use_mask_centroid}, aim_ema={self._aim_ema_enable} alpha={self._aim_ema_alpha:.2f}, "
-            f"draw_bbox={self._debug_draw_bbox}, draw_mask={self._debug_draw_mask})"
+            f"draw_bbox={self._debug_draw_bbox}, draw_mask={self._debug_draw_mask}, "
+            f"follow_enable_default={self._follow_enable})"
         )
+    # -------------------------------
+    # Follow enable gate
+    # -------------------------------
+    def _on_follow_enable(self, msg: Bool) -> None:
+        enabled = bool(msg.data)
+        if enabled == self._follow_enable:
+            return
+
+        self._follow_enable = enabled
+
+        if not enabled:
+            # 팔로우 OFF: 락/에러 상태 리셋
+            self._reset_lock_state()
+
+            # TRANSIENT_LOCAL 잔류 True 제거용으로 False 1회 publish
+            try:
+                self._pub_lock_done.publish(Bool(data=False))
+            except Exception:
+                pass
+
+            # UI 상태 캐시도 강제로 "없음"으로 맞춰서 이벤트 스팸 방지
+            self._ui_prev_has_target = False
+            self._ui_prev_locked_id = None
+
+            self._publish_ui_event("팔로우 비활성")
+            self.get_logger().warn("[YOLO_CAMERA] follow_enable -> False (inference gated)")
+        else:
+            # 팔로우 ON: 찌꺼기 방지용 리셋 후 재개
+            self._reset_lock_state()
+            self._ui_prev_has_target = False
+            self._ui_prev_locked_id = None
+
+            self._publish_ui_event("팔로우 활성")
+            self.get_logger().warn("[YOLO_CAMERA] follow_enable -> True (inference resumed)")
+
 
     # -------------------------------
     # Topic switching
@@ -328,6 +383,8 @@ class YoloCameraNode(Node):
         self._dbg_last_mode = "-"
         self._aim_ema_x = None
         self._aim_ema_y = None
+        self._last_ex = None
+        self._last_ey = None
 
     def _switch_image_topic(self, new_topic: str, *, reason: str) -> None:
         new_topic = str(new_topic).strip()
@@ -614,6 +671,29 @@ class YoloCameraNode(Node):
             frame_bgr = cv2.flip(frame_bgr, 1)
 
         h, w = frame_bgr.shape[:2]
+        # ✅ follow disabled: inference/lock/error input 차단
+        if not self._follow_enable:
+            self._last_ex = None
+            self._last_ey = None
+            self._publish_error(0.0, 0.0)
+
+            if self._pub_annotated is not None:
+                ann = frame_bgr.copy()
+                cv2.putText(
+                    ann,
+                    "FOLLOW DISABLED",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 0, 255),
+                    2,
+                )
+                self._publish_annotated_image(ann)
+
+            if self._show_debug:
+                cv2.imshow("yolo_camera_node", frame_bgr)
+                cv2.waitKey(1)
+            return
 
         results = self._run_inference(frame_bgr)
         result0 = results[0]
@@ -636,6 +716,8 @@ class YoloCameraNode(Node):
             self._dbg_last_mode = "-"
             self._aim_ema_x = None
             self._aim_ema_y = None
+            self._last_ex = None
+            self._last_ey = None
             self._publish_error(0.0, 0.0)
 
         self._maybe_publish_lock_done()
