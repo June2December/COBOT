@@ -45,8 +45,6 @@ class ShootRunner(Node):
         # ---- pub/sub ----
         self.sub = self.create_subscription(Bool, self.trigger_topic, self._on_trigger, 10)
         self.pub_done = self.create_publisher(Bool, self.done_topic, 10)
-        self.sub = self.create_subscription(Bool, self.trigger_topic, self._on_trigger, 10)
-        self.pub_done = self.create_publisher(Bool, self.done_topic, 10)
 
         # ---- state ----
         self._busy = False
@@ -60,7 +58,7 @@ class ShootRunner(Node):
         self.get_logger().info(
             f"Subscribed: {self.trigger_topic} (Bool). True -> shoot\n"
             f"Publish done: {self.done_topic} (Bool)\n"
-            f"Using service: {self._srv_move_joint_name}"
+            f"Using service: {self._srv_move_joint_name}\n"
             f"TTS: {'ON' if self.tts_enabled else 'OFF'} / \"{self.tts_text}\""
         )
 
@@ -82,12 +80,15 @@ class ShootRunner(Node):
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
+        if not self._cli_move_joint.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error(f"Service not available: {self._srv_move_joint_name}")
+            return False
         ok = False
         try:
             # ✅ 먼저 TTS
             if self.tts_enabled and self.tts_text.strip():
                 speak(self.tts_text)
-            ok = self._salute_motion()
+            ok = self._shoot_motion()
 
         except Exception:
             self.get_logger().error("Shoot failed:\n" + traceback.format_exc())
@@ -108,10 +109,11 @@ class ShootRunner(Node):
         req.mode = 0  # 기본 모드
 
         # 필드가 있을 때만 세팅 (환경별 msg 생성 차이 대비)
-        if hasattr(req, "blendType"):
-            req.blendType = 0
-        if hasattr(req, "syncType"):
-            req.syncType = 0
+        # srv 변수 오류 CamelCase 가 아녔음
+        if hasattr(req, "blend_type"):
+            req.blend_type = 0
+        if hasattr(req, "sync_type"):
+            req.sync_type = 0
 
         future = self._cli_move_joint.call_async(req)
 
@@ -129,26 +131,28 @@ class ShootRunner(Node):
             self.get_logger().error("move_joint returned success=False")
         return bool(resp.success)
 
-    def _salute_motion(self) -> bool:
+    def _shoot_motion(self) -> bool:
         vel = self.vel
         acc = self.acc
-
-        J_READY = [0, 0, 90, -90, 0, 0]
-        J_SALUTE1 = [0, 0, 85, -90, 0, 0]
-
+        J_READY = [-4., -24.82, -122.52, 175.12, -57.42, 90.]
+        # J_D = [-4., -24.82, -122.52, 175.12, -57.42, 90.]
+        J_SALUTE1 = [-4., -24.82, -122.52, 170.12, -57.42, 90.]
         self.get_logger().info("Robot: move to READY")
         if not self._call_movej(J_READY, vel=vel, acc=acc):
             return False
+        for i in range(3):
 
-        self.get_logger().info("Robot: SHOOT")
-        if not self._call_movej(J_SALUTE1, vel=100, acc=80): return False
+            self.get_logger().info(f"[{i+1}/3] Robot: SHOOT")
+            if not self._call_movej(J_SALUTE1, vel=100, acc=150): return False
 
-        self.get_logger().info("Robot: back to READY")
-        if not self._call_movej(J_READY, vel=100, acc=80):
+            self.get_logger().info("Robot: back to READY")
+            if not self._call_movej(J_READY, vel=100, acc=150):
+                return False
+        
+        self.get_logger().info("Robot: move to READY")
+        if not self._call_movej(J_READY, vel=vel, acc=acc):
             return False
-
         return True
-
 
 def main():
     rclpy.init()
